@@ -48,3 +48,23 @@ jobs:
             exit "$status"
           fi
           echo "No conflict markers in tracked files."
+
+      # uv con versión fija (la que usa el equipo) y Python 3.12, el piso de
+      # requires-python. La cache guarda solo descargas y se invalida cuando
+      # cambia uv.lock (design D3).
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.11.21"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # Falla si uv.lock no corresponde a pyproject.toml. Va aparte porque
+      # `uv sync --frozen` instala desde el lock sin comprobarlo (design D2).
+      - name: Lockfile in sync
+        run: uv lock --check
+
+      # Instala exactamente lo que dice uv.lock, sin resolver ni reescribirlo.
+      - name: Install dependencies
+        run: uv sync --frozen
