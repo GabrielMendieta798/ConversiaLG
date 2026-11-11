@@ -1,0 +1,50 @@
+# CI del change add-ci-pipeline (openspec/changes/add-ci-pipeline).
+# Corre la misma verificación que la skill run-verify sobre cada PR hacia
+# develop y main. Solo lee el repo: no despliega, no publica, no escribe ramas.
+# Sin secrets de GitHub (SEC-1, GEN-3): las credenciales son de prueba.
+name: ci
+
+on:
+  pull_request:
+    branches: [develop, main]
+
+# Token mínimo: solo lectura del contenido del repo.
+permissions:
+  contents: read
+
+# Un commit nuevo en el mismo PR cancela la corrida anterior.
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No deja el token guardado en .git/config para los pasos siguientes.
+          persist-credentials: false
+
+      # Antes de instalar nada: falla si un archivo versionado tiene un marcador
+      # de conflicto de apertura o de cierre al inicio de línea (design D7).
+      # El patrón usa cuantificadores para no contener los marcadores literales.
+      # git grep sale con 0 si encuentra, 1 si no encuentra, >1 si falla.
+      - name: Conflict markers
+        run: |
+          set +e
+          git grep -nE '^(<{7}|>{7})( |$)' -- .
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "::error::Conflict markers found in the files and lines listed above."
+            exit 1
+          fi
+          if [ "$status" -ne 1 ]; then
+            echo "::error::git grep failed with exit code $status."
+            exit "$status"
+          fi
+          echo "No conflict markers in tracked files."
