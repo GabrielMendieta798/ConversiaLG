@@ -2,6 +2,134 @@
 
 WhatsApp bot for restaurants built with FastAPI and PostgreSQL.
 
+## CI
+
+Cada Pull Request hacia `develop` o `main` corre el workflow `ci`
+(`.github/workflows/ci.yml`), con un único job `verify`. Corre al abrir el PR,
+con cada commit nuevo y al reabrirlo. Si llega un commit nuevo mientras una
+corrida del mismo PR sigue en curso, esa corrida se cancela. El workflow solo
+lee el repo (`permissions: contents: read`): no despliega, no publica y no
+escribe ramas. No usa secrets de GitHub; las credenciales que declara son de
+prueba y valen solo para el contenedor de PostgreSQL de esa corrida.
+
+### Qué corre y en qué orden
+
+El job corre en `ubuntu-24.04` con un tope de 20 minutos. Los pasos van en
+orden, y el primero que falla corta el job: los siguientes quedan salteados.
+
+| # | Paso | Qué hace |
+|---|------|----------|
+| 1 | `Checkout` | `actions/checkout` fijado por SHA, sin dejar el token en `.git/config`. |
+| 2 | `Conflict markers` | `git grep -nE '^(<{7}\|>{7})( \|$)' -- .`: falla si un archivo versionado tiene un marcador de conflicto de apertura (`<{7}`) o de cierre (`>{7}`) al inicio de línea, y lista archivo y línea. |
+| 3 | `Set up uv and Python 3.12` | `astral-sh/setup-uv` fijado por SHA, uv `0.11.21`, Python `3.12` y cache de descargas invalidada por `uv.lock`. |
+| 4 | `Lockfile in sync` | `uv lock --check`: falla si `uv.lock` no corresponde a `pyproject.toml`. |
+| 5 | `Install dependencies` | `uv sync --frozen`: instala exactamente lo que dice `uv.lock`. |
+| 6 | `Lint (ruff check)` | `uv run --frozen ruff check .` |
+| 7 | `Format (ruff format --check)` | `uv run --frozen ruff format --check .` |
+| 8 | `Typecheck (mypy backend/app)` | `uv run --frozen mypy backend/app` |
+| 9 | `Unit tests (pytest -m unit)` | `uv run --frozen pytest -m unit` |
+| 10 | `Create database role and databases` | Espera a PostgreSQL y, con el superusuario de bootstrap, crea el rol `bot_resto_ci` (sin superusuario, sin `CREATEDB`, sin `CREATEROLE`) y las bases `bot_resto_ci` y `bot_resto_ci_test`, ambas con ese rol como dueño. |
+| 11 | `Apply migrations (alembic upgrade head)` | Desde `backend/`: `uv run --frozen alembic upgrade head` sobre `bot_resto_ci`. |
+| 12 | `Integration tests (pytest -m integration)` | `uv run --frozen pytest -m integration`. Los tests destructivos de migración usan `bot_resto_ci_test`. |
+| 13 | `Application database intact` | Como `bot_resto_ci`, confirma que `bot_resto_ci` sigue en el head de Alembic y conserva `alembic_version`, `customers` y `menu_items`. |
+
+Los pasos 6, 7, 8, 9 y 12 son los cinco de `run-verify`, en el mismo orden.
+
+La base es un service container `postgres:16.15` con healthcheck
+`pg_isready`, creado para la corrida y descartado al terminar. El job le pasa
+a todos los pasos `APP_ENV=test` y
+`DATABASE_URL=postgresql+psycopg://bot_resto_ci:ci_test_only_password@localhost:5432/bot_resto_ci`.
+
+### Reproducirlo en local
+
+Los comandos son de bash (en Windows, Git Bash) y se corren desde la raíz del
+repo. Necesitan Docker, uv y el cliente `psql`. La base es un contenedor
+descartable en el puerto `55432`, para no chocar con la base de desarrollo.
+
+1. Levantar PostgreSQL con la misma imagen y el mismo bootstrap que el CI:
+
+   ```bash
+   docker run --rm -d --name bot-resto-ci-local \
+     -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=ci_bootstrap_test_password \
+     -p 55432:5432 postgres:16.15
+   ```
+
+2. Exportar el mismo entorno que el job, cambiando solo el puerto. Las
+   variables del proceso tienen prioridad sobre el `.env`:
+
+   ```bash
+   export APP_ENV=test
+   export DATABASE_URL=postgresql+psycopg://bot_resto_ci:ci_test_only_password@localhost:55432/bot_resto_ci
+   ```
+
+3. Correr los pasos en el orden del CI, y frenar en el primero que falle:
+
+   ```bash
+   git grep -nE '^(<{7}|>{7})( |$)' -- .   # tiene que salir vacío
+   uv lock --check
+   uv sync --frozen
+   uv run --frozen ruff check .
+   uv run --frozen ruff format --check .
+   uv run --frozen mypy backend/app
+   uv run --frozen pytest -m unit
+   ```
+
+4. Crear el rol y las dos bases. Si `pg_isready` no da `accepting
+   connections`, esperar unos segundos y repetir:
+
+   ```bash
+   PGPASSWORD=ci_bootstrap_test_password pg_isready -h localhost -p 55432 -U postgres
+   PGPASSWORD=ci_bootstrap_test_password psql -h localhost -p 55432 -U postgres \
+     -d postgres -v ON_ERROR_STOP=1 <<'SQL'
+   CREATE ROLE bot_resto_ci LOGIN PASSWORD 'ci_test_only_password'
+     NOSUPERUSER NOCREATEDB NOCREATEROLE;
+   CREATE DATABASE bot_resto_ci OWNER bot_resto_ci;
+   CREATE DATABASE bot_resto_ci_test OWNER bot_resto_ci;
+   SQL
+   ```
+
+5. Aplicar las migraciones, correr la suite de integración y comprobar que la
+   base de la app quedó intacta:
+
+   ```bash
+   (cd backend && uv run --frozen alembic upgrade head)
+   uv run --frozen pytest -m integration
+   (cd backend && uv run --frozen alembic heads)    # el head esperado
+   psql "${DATABASE_URL/+psycopg/}" -At \
+     -c "SELECT version_num FROM alembic_version" \
+     -c "SELECT to_regclass('public.customers'), to_regclass('public.menu_items')"
+   ```
+
+   `version_num` tiene que coincidir con el head, y las dos tablas tienen que
+   aparecer con su nombre, no vacías.
+
+6. Borrar la base descartable:
+
+   ```bash
+   docker stop bot-resto-ci-local
+   ```
+
+Corré `pytest -m unit` y `pytest -m integration` por separado, como el CI. Hoy
+`uv run pytest` sin marker, en un solo proceso, falla en 9 tests unitarios de
+logging: `backend/alembic/env.py` llama a `fileConfig` sin
+`disable_existing_loggers=False` y apaga los loggers de la app cuando los tests
+de migración corren antes que los unitarios. Es un hallazgo abierto, ajeno a
+este CI.
+
+### Branch protection (paso manual en GitHub)
+
+El workflow corre en cada PR, pero no bloquea el merge por sí solo. Para que
+el check sea obligatorio, alguien con permisos de administración del repo
+tiene que configurarlo a mano en GitHub (Settings → Branches o Rules), en
+`develop` y en `main`:
+
+- exigir que el status check `verify` pase antes de mergear (en el PR aparece
+  como `ci / verify`);
+- exigir al menos una revisión aprobada.
+
+Esta configuración no está versionada en el repo: si se cambia, hay que
+hacerlo en GitHub.
+
 ## Bitácora
 
 ### 02–03/10/2026 — `add-application-skeleton`

@@ -1,0 +1,72 @@
+# Tasks: Add CI pipeline on Pull Requests
+
+No implementation task starts until this proposal, design and spec are
+explicitly approved (`SDD-1`). Nothing under `backend/`, `tests/`, `config/`,
+`pyproject.toml` or `uv.lock` changes in this change; if the CI cannot work
+without touching them, stop and propose a new scenario (`SDD-2`).
+
+## 1. Workflow skeleton
+
+- [x] 1.1 Create `.github/workflows/ci.yml` triggered by `pull_request` on `develop` and `main`, runner `ubuntu-24.04`, `permissions: contents: read`, per-PR `concurrency` with `cancel-in-progress: true`, and `timeout-minutes` on the job.
+- [x] 1.2 Look up the commit SHA of the current releases of `actions/checkout` and `astral-sh/setup-uv` from their official repositories (GitHub API and `git ls-remote`). Pin `actions/checkout` by full SHA with the tag as a comment (v7.0.1 → `3d3c42e5aac5ba805825da76410c181273ba90b1`). `astral-sh/setup-uv` is not used until 2.1: its SHA is recorded here (v10.3.3 → `68559e99cc807c1eb7e9238fd43a15bba460eec2`, verified 2026-11-11) and it is pinned in 2.1.
+- [x] 1.3 Add the conflict-marker step right after checkout (D7), matching only the opening and closing markers with the quantified pattern `^(<{7}|>{7})( |$)`; confirm locally that `git grep` finds no marker in the current tree, including `ci.yml` and the change's own files.
+
+## 2. Toolchain installation
+
+- [x] 2.1 Set up uv with a pinned version, cache enabled and keyed by `uv.lock`, and Python 3.12. Re-verify the `astral-sh/setup-uv` SHA recorded in 1.2 against the official repository before using it, and pin it by full SHA with the tag as a comment.
+- [x] 2.2 Add `uv lock --check` followed by `uv sync --frozen` (D2).
+
+## 3. Verification steps
+
+- [x] 3.1 Declare the job `env` with `APP_ENV=test` and the test `DATABASE_URL` (D8); confirm no `secrets.` reference and no environment dump.
+- [x] 3.2 Add, in order and each as its own named step, `uv run --frozen ruff check`, `ruff format --check`, `mypy backend/app` and `pytest -m unit`.
+- [x] 3.3 Run those four commands locally with the same `APP_ENV`/`DATABASE_URL` and no `.env` interference, and confirm they pass.
+
+## 4. Database and integration
+
+- [x] 4.1 Add the `postgres:16.<minor>` service with a `pg_isready` healthcheck and test-only bootstrap credentials, with an exact image tag.
+- [x] 4.2 Add the step that waits for the database and creates the non-superuser role and both databases owned by it (D4).
+- [x] 4.3 Add `alembic upgrade head` on the application database from `backend/` (D5).
+- [x] 4.4 Add `uv run --frozen pytest -m integration`.
+- [x] 4.5 Add the post-integration check that the application database is still at the Alembic head with `customers` and `menu_items` present (D6).
+
+## 5. Documentation
+
+- [x] 5.1 Add a CI section to `README.md`: what runs and in which order, how to reproduce it locally (both databases, migration, env vars, commands), and branch protection as a manual GitHub step. Name the conflict markers only with the quantified pattern, never literally at the start of a line.
+
+## 6. Verification of the CI itself (D9)
+
+- [x] 6.1 Run the complete `run-verify` locally and record the result.
+  - 2026-11-12, local (Windows, Python 3.13), the five steps run separately and in CI order against the dev database (PostgreSQL 16, port 5433):
+    - `uv run ruff check .`: All checks passed.
+    - `uv run ruff format --check .`: 99 files already formatted.
+    - `uv run mypy backend/app`: no issues found in 35 source files.
+    - `uv run pytest -m unit`: 242 passed, 41 deselected.
+    - `uv run pytest -m integration`: 41 passed, 242 deselected.
+  - Only warning: `StarletteDeprecationWarning` (httpx with `starlette.testclient`), not blocking.
+  - `uv run pytest` without a marker was not used: in a single process it fails 9 unit logging tests because `backend/alembic/env.py:25` calls `fileConfig` with the default `disable_existing_loggers=True` (open finding, outside this change).
+  - Security review (`security` subagent, read-only) of `ci.yml` and the README CI section: no high, medium or low findings; 5 informational notes, no action required.
+- [x] 6.2 Lautaro opens the change PR to `develop`; record that the check passes and shows the five verification steps (scenario "Everything green").
+  - PR #30 against `develop`, run #2: the 20 steps of the `verify` job green, including the five verification steps (lint, format, mypy, unit, integration). Integration: 41 passed.
+- [x] 6.3 On a throwaway draft PR, push one breaking commit at a time and record the failing step and the skipped later steps for: lint, format, mypy, unit test, integration test, conflict marker, lockfile drift, unreachable database. Revert each; never merge; delete the branch afterwards.
+  - Draft PR #31 (closed without merging, branch deleted). Each case failed at the expected step:
+    - lint: `Lint (ruff check)`, F401 in a test file.
+    - format: `Format (ruff format --check)`, 1 file would be reformatted.
+    - mypy: `Typecheck (mypy backend/app)`, incompatible types in assignment.
+    - unit test: `Unit tests (pytest -m unit)`, 1 failed and 242 passed.
+    - integration test: `Integration tests (pytest -m integration)`, 1 failed and 41 passed.
+    - conflict marker: `Conflict markers`, reported the file and the line.
+    - lockfile drift: `Lockfile in sync` (`uv lock --check`), "The lockfile at uv.lock needs to be updated".
+    - unreachable database: `Create database role and databases`, "PostgreSQL did not accept connections" after about 60 s; the `Apply migrations` step was skipped.
+  - The steps after each failure did not run. No test commit was merged.
+- [x] 6.4 Re-run the check on the same green commit and record an identical result (scenario "Same commit twice").
+  - The run was re-executed on the same commit (Re-run all jobs): attempt #2, same result, the same steps green.
+- [x] 6.5 Push two commits in quick succession to a PR and record that the first run was cancelled.
+  - Two pushes in a row to the test PR: the first run was cancelled after 9 s ("The operation was canceled"), during container initialization, and only the second one ran.
+- [x] 6.6 Record in the integration log that the migration tests ran against `bot_resto_ci_test` and that the post-integration check passed.
+  - In the integration log the 7 tests of `test_bigint_migration.py` passed with the non-superuser role on the service Postgres, and the `Application database intact` step was green. The log does not print the database name.
+
+## 7. Close
+
+- [ ] 7.1 Lautaro/Gabriel configure branch protection on `develop` and `main` requiring the check and one approved review; record it was done.
+- [ ] 7.2 Add to `ESTADO.md` only the line for this change, without touching other outdated entries, and add the README log entry (`SDD-5`).

@@ -1,0 +1,185 @@
+# CI del change add-ci-pipeline (openspec/changes/add-ci-pipeline).
+# Corre la misma verificación que la skill run-verify sobre cada PR hacia
+# develop y main. Solo lee el repo: no despliega, no publica, no escribe ramas.
+# Sin secrets de GitHub (SEC-1, GEN-3): las credenciales son de prueba.
+name: ci
+
+on:
+  pull_request:
+    branches: [develop, main]
+
+# Token mínimo: solo lectura del contenido del repo.
+permissions:
+  contents: read
+
+# Un commit nuevo en el mismo PR cancela la corrida anterior.
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Entorno de la app para todos los pasos (design D8). app.main arma la app
+    # al importarse, así que hasta `pytest -m unit` necesita estas dos claves.
+    # La clave es de prueba: solo vale para el contenedor descartable de esta
+    # corrida, no es un secret y no contiene `%`. El rol bot_resto_ci no es
+    # superusuario (design D4).
+    env:
+      APP_ENV: test
+      DATABASE_URL: postgresql+psycopg://bot_resto_ci:ci_test_only_password@localhost:5432/bot_resto_ci
+    # PostgreSQL 16 descartable, creado para esta corrida y destruido al final
+    # (design D4). Tag exacto, no `16` ni `latest` (design D3). El superusuario
+    # `postgres` es solo de bootstrap: crea el rol y las bases de la app y nada
+    # más lo usa. Su clave es de prueba y vale solo para este contenedor.
+    services:
+      postgres:
+        image: postgres:16.15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci_bootstrap_test_password
+        ports:
+          - 5432:5432
+        # Actions no arranca los pasos hasta que el healthcheck da sano.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No deja el token guardado en .git/config para los pasos siguientes.
+          persist-credentials: false
+
+      # Antes de instalar nada: falla si un archivo versionado tiene un marcador
+      # de conflicto de apertura o de cierre al inicio de línea (design D7).
+      # El patrón usa cuantificadores para no contener los marcadores literales.
+      # git grep sale con 0 si encuentra, 1 si no encuentra, >1 si falla.
+      - name: Conflict markers
+        run: |
+          set +e
+          git grep -nE '^(<{7}|>{7})( |$)' -- .
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "::error::Conflict markers found in the files and lines listed above."
+            exit 1
+          fi
+          if [ "$status" -ne 1 ]; then
+            echo "::error::git grep failed with exit code $status."
+            exit "$status"
+          fi
+          echo "No conflict markers in tracked files."
+
+      # uv con versión fija (la que usa el equipo) y Python 3.12, el piso de
+      # requires-python. La cache guarda solo descargas y se invalida cuando
+      # cambia uv.lock (design D3).
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.11.21"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # Falla si uv.lock no corresponde a pyproject.toml. Va aparte porque
+      # `uv sync --frozen` instala desde el lock sin comprobarlo (design D2).
+      - name: Lockfile in sync
+        run: uv lock --check
+
+      # Instala exactamente lo que dice uv.lock, sin resolver ni reescribirlo.
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # Los pasos de run-verify, en su orden y uno por paso para que cada uno
+      # aparezca con nombre propio en el reporte. Actions corta en el primer
+      # paso que falla y saltea el resto (design D1). `--frozen` evita que
+      # `uv run` re-lockee o re-sincronice (design D2).
+      - name: Lint (ruff check)
+        run: uv run --frozen ruff check .
+
+      - name: Format (ruff format --check)
+        run: uv run --frozen ruff format --check .
+
+      - name: Typecheck (mypy backend/app)
+        run: uv run --frozen mypy backend/app
+
+      - name: Unit tests (pytest -m unit)
+        run: uv run --frozen pytest -m unit
+
+      # La base se prepara recién acá: un error de lint no espera a PostgreSQL
+      # (design D1). Con el superusuario de bootstrap se crea el rol de la app,
+      # sin superusuario ni CREATEDB, igual que en local, y las dos bases con
+      # ese rol como dueño: la de la app y su gemela _test que exigen los tests
+      # destructivos de migración (design D4). PGPASSWORD del bootstrap vive
+      # solo en este paso (design D8).
+      - name: Create database role and databases
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: postgres
+          PGPASSWORD: ci_bootstrap_test_password
+        run: |
+          # Cinturón además del healthcheck del service: si la base no responde,
+          # el paso falla y nunca se llega a pytest.
+          for attempt in $(seq 1 30); do
+            if pg_isready -q -d postgres; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "::error::PostgreSQL did not accept connections."
+              exit 1
+            fi
+            sleep 2
+          done
+          psql -v ON_ERROR_STOP=1 -d postgres <<'SQL'
+          CREATE ROLE bot_resto_ci LOGIN PASSWORD 'ci_test_only_password'
+            NOSUPERUSER NOCREATEDB NOCREATEROLE;
+          CREATE DATABASE bot_resto_ci OWNER bot_resto_ci;
+          CREATE DATABASE bot_resto_ci_test OWNER bot_resto_ci;
+          SQL
+
+      # Toda la cadena de migraciones sobre la base de la app, desde cero
+      # (design D5). Corre desde backend/ por alembic.ini (prepend_sys_path = .)
+      # y con el env del job, porque env.py lee DATABASE_URL de la app. Los
+      # tests normales de integración asumen este esquema ya aplicado.
+      - name: Apply migrations (alembic upgrade head)
+        working-directory: backend
+        run: uv run --frozen alembic upgrade head
+
+      # Quinto paso de run-verify. Si la base no responde, el conftest corta la
+      # sesión con exit 1 (VER-6): nunca hay tests salteados ni pasados sin
+      # base. Los tests destructivos de migración usan bot_resto_ci_test.
+      - name: Integration tests (pytest -m integration)
+        run: uv run --frozen pytest -m integration
+
+      # Si un test destructivo hubiera apuntado a la base de la app, su
+      # DROP SCHEMA public CASCADE se habría llevado tablas y alembic_version
+      # (design D6). Se verifica como el rol de la app, contra su base, que
+      # sigue en el head (leído de alembic, no escrito a mano) y con sus tablas.
+      - name: Application database intact
+        run: |
+          expected_head="$(cd backend && uv run --frozen alembic heads | awk '{print $1}')"
+          if [ -z "$expected_head" ] || [ "$(printf '%s\n' "$expected_head" | wc -l)" -ne 1 ]; then
+            echo "::error::Expected exactly one Alembic head, got: '${expected_head}'."
+            exit 1
+          fi
+          # psql no entiende el driver de SQLAlchemy: se quita `+psycopg`.
+          app_db_url="${DATABASE_URL/+psycopg/}"
+          missing="$(psql "$app_db_url" -v ON_ERROR_STOP=1 -At -c \
+            "SELECT string_agg(t, ', ') FROM unnest(ARRAY['alembic_version', 'customers', 'menu_items']) AS t WHERE to_regclass('public.' || t) IS NULL")"
+          if [ -n "$missing" ]; then
+            echo "::error::Application database is missing tables after the integration suite: ${missing}."
+            exit 1
+          fi
+          current="$(psql "$app_db_url" -v ON_ERROR_STOP=1 -At -c \
+            "SELECT string_agg(version_num, ', ') FROM alembic_version")"
+          if [ "$current" != "$expected_head" ]; then
+            echo "::error::Application database is at revision '${current}', expected head '${expected_head}'."
+            exit 1
+          fi
+          echo "Application database at head ${current} with customers and menu_items present."
