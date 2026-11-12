@@ -32,7 +32,7 @@ without touching them, stop and propose a new scenario (`SDD-2`).
 
 ## 5. Documentation
 
-- [ ] 5.1 Add a CI section to `README.md`: what runs and in which order, how to reproduce it locally (both databases, migration, env vars, commands), and branch protection as a manual GitHub step. Name the conflict markers only with the quantified pattern, never literally at the start of a line.
+- [x] 5.1 Add a CI section to `README.md`: what runs and in which order, how to reproduce it locally (both databases, migration, env vars, commands), and branch protection as a manual GitHub step. Name the conflict markers only with the quantified pattern, never literally at the start of a line.
 
 ## 6. Verification of the CI itself (D9)
 
