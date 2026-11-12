@@ -41,7 +41,7 @@ jobs:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: ci_bootstrap_test_password
         ports:
-          - 5432:5432
+          - 5433:5432
         # Actions no arranca los pasos hasta que el healthcheck da sano.
         options: >-
           --health-cmd "pg_isready -U postgres"
