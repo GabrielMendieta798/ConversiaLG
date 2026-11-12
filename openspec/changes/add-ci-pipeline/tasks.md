@@ -46,11 +46,25 @@ without touching them, stop and propose a new scenario (`SDD-2`).
   - Only warning: `StarletteDeprecationWarning` (httpx with `starlette.testclient`), not blocking.
   - `uv run pytest` without a marker was not used: in a single process it fails 9 unit logging tests because `backend/alembic/env.py:25` calls `fileConfig` with the default `disable_existing_loggers=True` (open finding, outside this change).
   - Security review (`security` subagent, read-only) of `ci.yml` and the README CI section: no high, medium or low findings; 5 informational notes, no action required.
-- [ ] 6.2 Lautaro opens the change PR to `develop`; record that the check passes and shows the five verification steps (scenario "Everything green").
-- [ ] 6.3 On a throwaway draft PR, push one breaking commit at a time and record the failing step and the skipped later steps for: lint, format, mypy, unit test, integration test, conflict marker, lockfile drift, unreachable database. Revert each; never merge; delete the branch afterwards.
-- [ ] 6.4 Re-run the check on the same green commit and record an identical result (scenario "Same commit twice").
-- [ ] 6.5 Push two commits in quick succession to a PR and record that the first run was cancelled.
-- [ ] 6.6 Record in the integration log that the migration tests ran against `bot_resto_ci_test` and that the post-integration check passed.
+- [x] 6.2 Lautaro opens the change PR to `develop`; record that the check passes and shows the five verification steps (scenario "Everything green").
+  - PR #30 against `develop`, run #2: the 20 steps of the `verify` job green, including the five verification steps (lint, format, mypy, unit, integration). Integration: 41 passed.
+- [x] 6.3 On a throwaway draft PR, push one breaking commit at a time and record the failing step and the skipped later steps for: lint, format, mypy, unit test, integration test, conflict marker, lockfile drift, unreachable database. Revert each; never merge; delete the branch afterwards.
+  - Draft PR #31 (closed without merging, branch deleted). Each case failed at the expected step:
+    - lint: `Lint (ruff check)`, F401 in a test file.
+    - format: `Format (ruff format --check)`, 1 file would be reformatted.
+    - mypy: `Typecheck (mypy backend/app)`, incompatible types in assignment.
+    - unit test: `Unit tests (pytest -m unit)`, 1 failed and 242 passed.
+    - integration test: `Integration tests (pytest -m integration)`, 1 failed and 41 passed.
+    - conflict marker: `Conflict markers`, reported the file and the line.
+    - lockfile drift: `Lockfile in sync` (`uv lock --check`), "The lockfile at uv.lock needs to be updated".
+    - unreachable database: `Create database role and databases`, "PostgreSQL did not accept connections" after about 60 s; the `Apply migrations` step was skipped.
+  - The steps after each failure did not run. No test commit was merged.
+- [x] 6.4 Re-run the check on the same green commit and record an identical result (scenario "Same commit twice").
+  - The run was re-executed on the same commit (Re-run all jobs): attempt #2, same result, the same steps green.
+- [x] 6.5 Push two commits in quick succession to a PR and record that the first run was cancelled.
+  - Two pushes in a row to the test PR: the first run was cancelled after 9 s ("The operation was canceled"), during container initialization, and only the second one ran.
+- [x] 6.6 Record in the integration log that the migration tests ran against `bot_resto_ci_test` and that the post-integration check passed.
+  - In the integration log the 7 tests of `test_bigint_migration.py` passed with the non-superuser role on the service Postgres, and the `Application database intact` step was green. The log does not print the database name.
 
 ## 7. Close
 
