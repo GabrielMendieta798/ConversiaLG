@@ -2,106 +2,266 @@
 
 ## ADDED Requirements
 
-### Requirement: Persist the inbound message identity
+### Requirement: Authenticate the original request body
 
-The system SHALL use the opaque WhatsApp `message_id` as the primary key of a
-minimal processed-message record.
+The POST webhook MUST validate `X-Hub-Signature-256` before parsing the body,
+opening a database Session or performing any effect. It MUST compute
+HMAC-SHA256 over the exact bytes received from HTTP with
+`WHATSAPP_APP_SECRET` and MUST compare the expected and received signatures
+with `hmac.compare_digest`.
 
-#### Scenario: A new message is claimed
+The system MUST NOT reserialize JSON before verification. It MUST NOT log the
+request body, signature or app secret.
 
-- **GIVEN** the webhook signature is valid
-- **AND** no committed row exists for the `message_id`
-- **WHEN** processing begins
-- **THEN** the system inserts the `message_id` in the current transaction
-- **AND** `received_at` is populated as a UTC timestamp
-- **AND** no webhook payload or customer PII is persisted in the record
+#### Scenario: Valid signature over the original bytes
 
-### Requirement: Process a message once
+- **GIVEN** a request body has been signed as `sha256=<hex digest>` with the
+  configured app secret
+- **WHEN** the POST webhook receives the unchanged bytes and that header
+- **THEN** signature verification succeeds
+- **AND** the request may proceed to the production-runtime availability check
 
-The system SHALL claim a message with a single PostgreSQL insert using conflict
-handling rather than a select-then-insert sequence.
+#### Scenario: Reserialized JSON does not replace the original body
 
-#### Scenario: Meta retries a committed message
+- **GIVEN** the original JSON bytes and a semantically equivalent
+  reserialization have different byte representations
+- **AND** the signature was computed over the original bytes
+- **WHEN** the webhook verifies the request
+- **THEN** the original bytes validate
+- **AND** the reserialized bytes do not validate with that signature
 
-- **GIVEN** a committed row already exists for a `message_id`
-- **WHEN** the same `message_id` is received again
-- **THEN** the webhook returns HTTP 200 without a useful body
-- **AND** no Conversation lock is acquired
-- **AND** no domain effect or outgoing send is repeated
+#### Scenario: Missing or malformed signature
 
-#### Scenario: Two requests claim the same message concurrently
+- **WHEN** the signature header is absent, does not use the `sha256` scheme or
+  does not contain a valid SHA-256 hexadecimal digest
+- **THEN** the endpoint responds with HTTP 403 and the uniform error body
+- **AND** the parser is not invoked
+- **AND** no database Session is opened
+- **AND** no processed-message row or handler effect is created
 
-- **GIVEN** no committed row initially exists for a `message_id`
-- **WHEN** two transactions attempt to claim it concurrently
-- **THEN** PostgreSQL allows only one transaction to retain the row
-- **AND** exactly one transaction applies the domain effect
-- **AND** the other request completes as a duplicate
+#### Scenario: Incorrect signature
 
-### Requirement: Share the domain transaction
+- **WHEN** the signature is well formed but does not match the original body
+- **THEN** the endpoint responds with HTTP 403 and the uniform error body
+- **AND** the parser is not invoked
+- **AND** no database Session is opened
+- **AND** no processed-message row or handler effect is created
 
-The system SHALL persist the processed-message row and all effects of that
-inbound message in one transaction.
+### Requirement: Fail closed until the real production runtime exists
 
-#### Scenario: Processing succeeds
+The production application composition MUST NOT import, instantiate or use the
+test parser, handler, handler factory or dispatcher as defaults. Test doubles
+MUST be supplied only by test fixtures, a test application factory or explicit
+FastAPI dependency overrides.
 
-- **WHEN** the domain effect commits successfully
-- **THEN** the processed-message row commits with it
-- **AND** external responses and notifications are attempted after commit
+Until `add-whatsapp-cloud-api-roundtrip` provides the approved production
+composition, a correctly signed POST request MUST return the existing opaque
+HTTP 503 Service Unavailable response before parser invocation or database
+access. Change 4b MUST replace the unavailable production provider without
+changing the route, ports or transaction boundary.
 
-#### Scenario: Processing fails after the claim
+#### Scenario: Signed webhook cannot use test doubles in production
 
-- **GIVEN** the `message_id` was inserted in the current transaction
-- **WHEN** processing raises an error before commit
-- **THEN** the processed-message row and domain effects roll back together
-- **AND** the webhook returns a 5xx response
-- **AND** a later retry can claim and process the same `message_id`
+- **GIVEN** the production application is running before change 4b
+- **AND** no real WhatsApp runtime has been composed
+- **WHEN** a correctly signed POST request reaches the webhook
+- **THEN** the endpoint responds with the uniform HTTP 503 response
+- **AND** it does not invoke a test or real parser, handler or dispatcher
+- **AND** it does not open a database Session or call the idempotency repository
+- **AND** it does not persist a processed-message row or handler effect
+- **AND** a retry after 4b installs the real runtime can be processed normally
 
-### Requirement: Preserve lock order
+#### Scenario: Authentication still precedes availability
 
-The system SHALL acquire resources in the order defined by `CONV-9`.
+- **GIVEN** the production WhatsApp runtime is unavailable
+- **WHEN** a request carries an invalid signature
+- **THEN** the endpoint responds with HTTP 403 rather than HTTP 503
+- **AND** it performs no parser, database, handler or dispatcher effect
 
-#### Scenario: A message modifies an order
+### Requirement: Accept validated messages through an injected parser port
 
-- **WHEN** an inbound message needs Conversation and Order locks
-- **THEN** the system first attempts the idempotency insert
-- **AND** then locks Conversation
-- **AND** then locks Order
-- **AND** no code path acquires them in another order
+After authentication, the webhook orchestration MUST give the original bytes
+to an injected batch parser. The parser MUST return a sequence of validated,
+typed message objects that expose an opaque, non-empty `message_id`. The
+transactional handler MUST NOT receive a raw dictionary.
 
-### Requirement: Validate authenticity before idempotency
+Because a Protocol does not validate at runtime, the 4a orchestration MUST
+validate the entire parser result before opening the first database Session.
+Every `message_id` MUST be a `str` containing at least one non-whitespace
+character. Validation MUST NOT trim or otherwise normalize the opaque value.
 
-The system SHALL reject an invalid webhook signature before inserting any
-processed-message record.
+This change MUST provide the parser contract and test it with a fake. Parsing
+the real Meta payload, normalizing customer data, ignoring status updates and
+handling unsupported message types belong to
+`add-whatsapp-cloud-api-roundtrip`.
 
-#### Scenario: Signature is invalid
+#### Scenario: Parser returns multiple validated messages
 
-- **WHEN** a POST webhook has an invalid `X-Hub-Signature-256`
-- **THEN** the webhook returns HTTP 403
-- **AND** no processed-message row is created
-- **AND** no domain processing occurs
+- **WHEN** the authenticated parser returns multiple typed messages
+- **AND** every `message_id` satisfies the runtime identity invariant
+- **THEN** the webhook processes them in parser order
+- **AND** idempotency uses each object's `message_id`
 
-### Requirement: Process batched messages independently
+#### Scenario: Parser returns an invalid message identity
 
-The system SHALL give every `message_id` in a batched webhook an independent
-transactional outcome.
+- **WHEN** the configured parser returns any message whose `message_id` is not
+  a string, is empty or contains only whitespace
+- **THEN** the endpoint responds with a uniform 5xx response
+- **AND** no database Session is opened for any message in that batch
+- **AND** the idempotency repository, handler and dispatcher are not invoked
+- **AND** the invalid value is not included in logs or the HTTP response
+
+#### Scenario: Parser returns no inbound messages
+
+- **WHEN** the authenticated parser returns an empty sequence
+- **THEN** the webhook responds with HTTP 200 without opening a message
+  transaction or dispatching an action
+
+#### Scenario: Parser implementation is replaceable in 4b
+
+- **WHEN** the unavailable production runtime is replaced by a Meta parser
+  that returns a concrete Pydantic message type satisfying the same contract
+- **THEN** the idempotency orchestration, transaction boundary and handler
+  contract do not change
+
+### Requirement: Process a parsed batch one transaction at a time
+
+The webhook MUST process each parsed `message_id` with its own Session and
+`READ COMMITTED` transaction. Transactional failures use a fail-fast policy:
+messages after the failed item are not processed during that request.
+
+#### Scenario: Every message commits independently
+
+- **GIVEN** a parsed batch contains multiple new messages
+- **WHEN** every handler succeeds
+- **THEN** each claim and handler effect commits independently
+- **AND** each message's post-commit actions are dispatched only after that
+  message commits
 
 #### Scenario: One message in a batch fails
 
-- **GIVEN** a webhook contains multiple new `message_id` values
-- **AND** one message fails while another commits
-- **WHEN** Meta retries the webhook
-- **THEN** the committed message is recognized as a duplicate
-- **AND** the rolled-back message can be claimed again
-- **AND** the committed domain effect is not repeated
+- **GIVEN** earlier messages in a batch committed successfully
+- **WHEN** a later message fails before commit
+- **THEN** the successful messages remain committed
+- **AND** the failed message leaves no committed claim or partial handler effect
+- **AND** no later message in that request is processed
+- **AND** the webhook responds with a 5xx status
 
-### Requirement: Keep processed-message records minimal
+#### Scenario: Retry a partially successful batch
 
-The system SHALL NOT store webhook payloads, customer messages, phone numbers,
-delivery addresses or outbound delivery states in
-`processed_whatsapp_messages`.
+- **WHEN** the same authenticated batch is retried
+- **THEN** previously committed message IDs resolve as duplicates
+- **AND** their handlers and external actions are not repeated
+- **AND** the rolled-back message and messages not reached after it can be
+  claimed and processed normally
 
-#### Scenario: Inspect a processed-message row
+### Requirement: Dispatch descriptive actions only after commit
 
-- **WHEN** a processed-message row is read
-- **THEN** it contains only the opaque `message_id` and `received_at`
+The transaction-bound handler MUST return descriptive actions without calling
+external services. The webhook orchestration MUST pass those actions to an
+injected dispatcher only after the corresponding message transaction commits.
 
+The dispatcher contract MUST be replaceable by the WhatsApp Cloud API adapter
+in 4b without changing the handler or transaction orchestration.
+
+#### Scenario: Transaction rolls back
+
+- **WHEN** message processing rolls back
+- **THEN** none of that attempt's actions is passed to the dispatcher
+
+#### Scenario: Transaction commits
+
+- **WHEN** a new message and its handler effects commit
+- **THEN** its actions may be dispatched after the transaction context has
+  closed successfully
+- **AND** the dispatcher has no database Session
+
+#### Scenario: External dispatch fails
+
+- **GIVEN** the message transaction already committed
+- **WHEN** its dispatcher raises an external-service error
+- **THEN** the committed claim and handler effects remain committed
+- **AND** the failure is logged without request content, token, complete phone
+  number or address
+- **AND** later messages in the batch continue processing
+- **AND** the webhook still responds with HTTP 200 if no transaction failed
+
+#### Scenario: Process crashes after commit and before dispatch
+
+- **WHEN** the database transaction commits
+- **AND** the process crashes before an external dispatch completes
+- **THEN** the committed `message_id` remains deduplicated
+- **AND** the system does not claim exactly-once external delivery
+
+### Requirement: Return stable and opaque webhook outcomes
+
+The POST webhook MUST declare a response model and preserve the uniform error
+contract. It MUST return HTTP 200 without a useful response body when all
+parsed messages either commit successfully or are committed duplicates. It
+MUST return HTTP 403 for an invalid signature and a 5xx status for a
+contract or transactional processing failure. Before 4b provides a real
+production runtime, a validly signed production request MUST return HTTP 503.
+
+#### Scenario: Process a new message
+
+- **WHEN** a validly signed new message is claimed and handled successfully
+- **THEN** the endpoint responds with HTTP 200 without a useful body
+
+#### Scenario: Receive a committed duplicate
+
+- **WHEN** a validly signed duplicate `message_id` is detected
+- **THEN** the endpoint responds with HTTP 200 without a useful body
+- **AND** it does not repeat the handler or post-commit actions
+
+#### Scenario: Handler failure is retryable
+
+- **WHEN** the handler raises and the message transaction rolls back
+- **THEN** the response is a uniform 5xx without exception text, SQL, table
+  names, stacktrace or customer data
+
+### Requirement: Log webhook outcomes once and without sensitive data
+
+The system MAY log the `message_id`, duration and an outcome of `claimed`,
+`duplicate`, `rolled_back` or `dispatch_failed`. It MUST NOT log the full
+webhook payload, message body, signature, app secret, complete phone number,
+customer name, delivery address, SQL parameters or a database exception's
+message.
+
+A transactional failure MUST reuse the opaque error-chain handling of the
+application error boundary (`D-25`) and MUST produce one error record, not one
+in the webhook plus another in middleware.
+
+#### Scenario: Transactional processing fails
+
+- **WHEN** message processing raises an error that may carry SQL parameters or
+  driver detail
+- **THEN** exactly one error record can be correlated by `message_id`
+- **AND** it contains the safe error type and opaque stack metadata
+- **AND** it contains no exception message, SQL parameters, payload or customer
+  data
+
+#### Scenario: Duplicate is logged safely
+
+- **WHEN** a committed duplicate is observed and an outcome record is emitted
+- **THEN** the record may contain `message_id` and `duplicate`
+- **AND** it contains no request body or customer data
+
+### Requirement: Preserve the future global lock order
+
+The webhook orchestration MUST complete the idempotency claim before building
+or invoking the injected handler. A duplicate MUST stop before the handler.
+
+The real Conversation, Order and Reservation locks are explicitly deferred to
+`add-conversation-state-machine`, which MUST implement and test the full order
+required by `CONV-9`.
+
+#### Scenario: New message reaches the extension point after claim
+
+- **WHEN** the injected handler is invoked for a new message
+- **THEN** the idempotency insert has already succeeded in its transaction
+
+#### Scenario: Duplicate stops before future locks
+
+- **WHEN** the idempotency insert identifies a duplicate
+- **THEN** the injected handler is not constructed or invoked
+- **AND** no future Conversation, Order or Reservation lock path can run
