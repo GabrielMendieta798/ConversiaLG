@@ -18,9 +18,9 @@ without touching them, stop and propose a new scenario (`SDD-2`).
 
 ## 3. Verification steps
 
-- [ ] 3.1 Declare the job `env` with `APP_ENV=test` and the test `DATABASE_URL` (D8); confirm no `secrets.` reference and no environment dump.
-- [ ] 3.2 Add, in order and each as its own named step, `uv run --frozen ruff check`, `ruff format --check`, `mypy backend/app` and `pytest -m unit`.
-- [ ] 3.3 Run those four commands locally with the same `APP_ENV`/`DATABASE_URL` and no `.env` interference, and confirm they pass.
+- [x] 3.1 Declare the job `env` with `APP_ENV=test` and the test `DATABASE_URL` (D8); confirm no `secrets.` reference and no environment dump.
+- [x] 3.2 Add, in order and each as its own named step, `uv run --frozen ruff check`, `ruff format --check`, `mypy backend/app` and `pytest -m unit`.
+- [x] 3.3 Run those four commands locally with the same `APP_ENV`/`DATABASE_URL` and no `.env` interference, and confirm they pass.
 
 ## 4. Database and integration
 

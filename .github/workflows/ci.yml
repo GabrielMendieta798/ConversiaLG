@@ -22,6 +22,14 @@ jobs:
     name: verify
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # Entorno de la app para todos los pasos (design D8). app.main arma la app
+    # al importarse, así que hasta `pytest -m unit` necesita estas dos claves.
+    # La clave es de prueba: solo vale para el contenedor descartable de esta
+    # corrida, no es un secret y no contiene `%`. El rol bot_resto_ci no es
+    # superusuario (design D4).
+    env:
+      APP_ENV: test
+      DATABASE_URL: postgresql+psycopg://bot_resto_ci:ci_test_only_password@localhost:5432/bot_resto_ci
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -68,3 +76,19 @@ jobs:
       # Instala exactamente lo que dice uv.lock, sin resolver ni reescribirlo.
       - name: Install dependencies
         run: uv sync --frozen
+
+      # Los pasos de run-verify, en su orden y uno por paso para que cada uno
+      # aparezca con nombre propio en el reporte. Actions corta en el primer
+      # paso que falla y saltea el resto (design D1). `--frozen` evita que
+      # `uv run` re-lockee o re-sincronice (design D2).
+      - name: Lint (ruff check)
+        run: uv run --frozen ruff check .
+
+      - name: Format (ruff format --check)
+        run: uv run --frozen ruff format --check .
+
+      - name: Typecheck (mypy backend/app)
+        run: uv run --frozen mypy backend/app
+
+      - name: Unit tests (pytest -m unit)
+        run: uv run --frozen pytest -m unit
