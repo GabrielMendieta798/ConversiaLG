@@ -36,7 +36,16 @@ without touching them, stop and propose a new scenario (`SDD-2`).
 
 ## 6. Verification of the CI itself (D9)
 
-- [ ] 6.1 Run the complete `run-verify` locally and record the result.
+- [x] 6.1 Run the complete `run-verify` locally and record the result.
+  - 2026-11-12, local (Windows, Python 3.13), the five steps run separately and in CI order against the dev database (PostgreSQL 16, port 5433):
+    - `uv run ruff check .`: All checks passed.
+    - `uv run ruff format --check .`: 99 files already formatted.
+    - `uv run mypy backend/app`: no issues found in 35 source files.
+    - `uv run pytest -m unit`: 242 passed, 41 deselected.
+    - `uv run pytest -m integration`: 41 passed, 242 deselected.
+  - Only warning: `StarletteDeprecationWarning` (httpx with `starlette.testclient`), not blocking.
+  - `uv run pytest` without a marker was not used: in a single process it fails 9 unit logging tests because `backend/alembic/env.py:25` calls `fileConfig` with the default `disable_existing_loggers=True` (open finding, outside this change).
+  - Security review (`security` subagent, read-only) of `ci.yml` and the README CI section: no high, medium or low findings; 5 informational notes, no action required.
 - [ ] 6.2 Lautaro opens the change PR to `develop`; record that the check passes and shows the five verification steps (scenario "Everything green").
 - [ ] 6.3 On a throwaway draft PR, push one breaking commit at a time and record the failing step and the skipped later steps for: lint, format, mypy, unit test, integration test, conflict marker, lockfile drift, unreachable database. Revert each; never merge; delete the branch afterwards.
 - [ ] 6.4 Re-run the check on the same green commit and record an identical result (scenario "Same commit twice").
