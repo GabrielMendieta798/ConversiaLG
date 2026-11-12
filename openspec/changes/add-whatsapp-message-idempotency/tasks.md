@@ -14,16 +14,16 @@ prove their behavior.
 
 - [x] 1.1 Add the `ProcessedWhatsAppMessage` SQLAlchemy model.
 - [x] 1.2 Export the model so Alembic metadata includes it.
-- [ ] 1.3 Confirm `57f88cf9ee63` is a new revision after `88d85f44fb7d` and
+- [x] 1.3 Confirm `57f88cf9ee63` is a new revision after `88d85f44fb7d` and
   that the initial or other historical migrations were not edited for 4a.
-- [ ] 1.4 Review `upgrade()` for a `TEXT` primary key and non-null
+- [x] 1.4 Review `upgrade()` for a `TEXT` primary key and non-null
   `TIMESTAMPTZ` `received_at` with a server-side `now()` default.
-- [ ] 1.5 Review `downgrade()` so it removes only
+- [x] 1.5 Review `downgrade()` so it removes only
   `processed_whatsapp_messages`.
-- [ ] 1.6 Add a dedicated PostgreSQL migration test that runs
+- [x] 1.6 Add a dedicated PostgreSQL migration test that runs
   `88d85f44fb7d -> 57f88cf9ee63 -> 88d85f44fb7d`, inspects the complete table
   contract and proves the parent schema is otherwise unchanged.
-- [ ] 1.7 Run the migration test only through the guarded dedicated `_test`
+- [x] 1.7 Run the migration test only through the guarded dedicated `_test`
   database fixture; do not run destructive schema reset against development.
 
 ### 2. Idempotency repository
@@ -33,14 +33,17 @@ prove their behavior.
 - [x] 2.2 Return the explicit `MessageClaimResult.CLAIMED` or
   `MessageClaimResult.DUPLICATE` contract.
 - [x] 2.3 Keep commit, rollback and transaction begin outside the repository.
-- [ ] 2.4 Add unit contract tests for claimed/duplicate return values without
+- [x] 2.4 Add unit contract tests for claimed/duplicate return values without
   treating them as concurrency evidence.
-- [ ] 2.5 Add PostgreSQL integration tests for a new claim, a committed
+- [x] 2.5 Add PostgreSQL integration tests for a new claim, a committed
   sequential duplicate, invisibility before caller commit and caller rollback.
-- [ ] 2.6 Extend the transaction-control guard to cover the WhatsApp
+- [x] 2.6 Extend the transaction-control guard to cover the WhatsApp
   idempotency repository or add an equivalent focused guard.
 - [ ] 2.7 Run the complete verification workflow and show the Group 1 results
   before checking tasks or starting Group 2.
+  Current blocker: the unchanged `origin/develop` menu-collation test requires
+  `en_US`, while both local PostgreSQL databases report `es_AR.UTF-8`. All
+  Group 1 focused tests pass; no menu code or database collation was changed.
 
 ## Group 2 — Signature, injectable contracts and shared transaction
 

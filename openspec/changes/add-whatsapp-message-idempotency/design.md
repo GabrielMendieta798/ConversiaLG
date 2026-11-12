@@ -124,6 +124,7 @@ a 4b.
 class MessageHandlerFactory(Protocol[MessageT, ActionT]):
     def build(self, session: Session) -> MessageHandler[MessageT, ActionT]: ...
 
+
 class MessageHandler(Protocol[MessageT, ActionT]):
     def handle(self, message: MessageT) -> Sequence[ActionT]: ...
 ```
