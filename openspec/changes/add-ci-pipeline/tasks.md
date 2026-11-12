@@ -24,11 +24,11 @@ without touching them, stop and propose a new scenario (`SDD-2`).
 
 ## 4. Database and integration
 
-- [ ] 4.1 Add the `postgres:16.<minor>` service with a `pg_isready` healthcheck and test-only bootstrap credentials, with an exact image tag.
-- [ ] 4.2 Add the step that waits for the database and creates the non-superuser role and both databases owned by it (D4).
-- [ ] 4.3 Add `alembic upgrade head` on the application database from `backend/` (D5).
-- [ ] 4.4 Add `uv run --frozen pytest -m integration`.
-- [ ] 4.5 Add the post-integration check that the application database is still at the Alembic head with `customers` and `menu_items` present (D6).
+- [x] 4.1 Add the `postgres:16.<minor>` service with a `pg_isready` healthcheck and test-only bootstrap credentials, with an exact image tag.
+- [x] 4.2 Add the step that waits for the database and creates the non-superuser role and both databases owned by it (D4).
+- [x] 4.3 Add `alembic upgrade head` on the application database from `backend/` (D5).
+- [x] 4.4 Add `uv run --frozen pytest -m integration`.
+- [x] 4.5 Add the post-integration check that the application database is still at the Alembic head with `customers` and `menu_items` present (D6).
 
 ## 5. Documentation
 
