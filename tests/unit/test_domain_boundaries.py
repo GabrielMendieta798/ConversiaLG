@@ -23,6 +23,9 @@ from app.core.config import PROJECT_ROOT
 BACKEND = PROJECT_ROOT / "backend"
 DOMAIN_ROOT = BACKEND / "app" / "domain"
 REPOSITORIES_ROOT = BACKEND / "app" / "db" / "repositories"
+WHATSAPP_IDEMPOTENCY_REPOSITORY = (
+    BACKEND / "app" / "integrations" / "whatsapp" / "idempotency_repository.py"
+)
 
 FORBIDDEN_IN_DOMAIN = ("sqlalchemy", "app.models", "app.core.database", "app.db")
 TRANSACTION_CONTROL = frozenset(
@@ -89,6 +92,12 @@ def _python_files(root: Path) -> list[Path]:
     # Sin archivos el chequeo pasaría sin verificar nada.
     assert files, f"no Python files found under {root}"
     return files
+
+
+TRANSACTION_OWNER_FILES = [
+    *_python_files(REPOSITORIES_ROOT),
+    WHATSAPP_IDEMPOTENCY_REPOSITORY,
+]
 
 
 # --- El detector mismo --------------------------------------------------------
@@ -183,8 +192,6 @@ def test_importing_the_whole_domain_loads_no_sqlalchemy() -> None:
 # --- Los repositorios no controlan la transacción -----------------------------
 
 
-@pytest.mark.parametrize(
-    "path", _python_files(REPOSITORIES_ROOT), ids=lambda p: _module_name(p)
-)
+@pytest.mark.parametrize("path", TRANSACTION_OWNER_FILES, ids=lambda p: _module_name(p))
 def test_repository_module_never_controls_the_transaction(path: Path) -> None:
     assert _transaction_calls(path.read_text(encoding="utf-8")) == []

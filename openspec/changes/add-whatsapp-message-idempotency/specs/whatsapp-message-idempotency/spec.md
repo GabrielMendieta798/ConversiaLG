@@ -13,19 +13,40 @@ The table MUST contain:
 - `received_at` as a non-null PostgreSQL `TIMESTAMPTZ` with a server-side
   `now()` default.
 
-The table MUST NOT require a numeric surrogate identifier.
+The table MUST NOT require a numeric surrogate identifier and MUST NOT contain
+the webhook payload or customer data.
 
 #### Scenario: Persist a successfully processed message
 
-- **WHEN** a new inbound `message_id` and its domain effect commit successfully
+- **WHEN** a new inbound `message_id` and its handler effect commit
+  successfully
 - **THEN** exactly one row exists for that `message_id`
 - **AND** `received_at` is populated by PostgreSQL
 
 #### Scenario: Keep the claim free of customer data
 
-- **WHEN** a processed-message row is stored
-- **THEN** it contains no webhook payload, message body, phone number, customer
-  name or delivery address
+- **WHEN** a processed-message row is inspected
+- **THEN** it contains only `message_id` and `received_at`
+- **AND** it contains no webhook payload, message body, signature, phone
+  number, customer name or delivery address
+
+### Requirement: Reject an invalid message identity before the claim
+
+The webhook orchestration MUST validate every parsed message identity before
+opening the first message Session or calling the idempotency repository. A
+`message_id` MUST be a `str` with at least one non-whitespace character. It
+MUST remain opaque and MUST NOT be trimmed or otherwise normalized before the
+claim.
+
+#### Scenario: Invalid identity cannot reach the repository
+
+- **GIVEN** an authenticated parser result contains a `message_id` that is not
+  a string, is empty or contains only whitespace
+- **WHEN** the orchestration validates the parsed batch
+- **THEN** it returns a uniform 5xx response
+- **AND** no Session is opened for any item in the batch
+- **AND** the idempotency repository is not called
+- **AND** no handler or external effect occurs
 
 ### Requirement: Claim a message atomically
 
@@ -46,140 +67,163 @@ It MUST NOT implement claim as a `SELECT` followed by a separate `INSERT`.
 - **WHEN** a committed row already exists for an inbound `message_id`
 - **THEN** the insert returns no row
 - **AND** the repository reports the message as duplicate
-- **AND** no domain effect is repeated
 
-#### Scenario: Receive the same message concurrently
+#### Scenario: Repository leaves transaction control to its caller
 
-- **WHEN** two transactions concurrently claim the same new `message_id`
-- **THEN** PostgreSQL allows at most one transaction to commit the claim
-- **AND** exactly one transaction applies the domain effect
-- **AND** the other transaction resolves as duplicate after the winner commits
+- **WHEN** the repository claims a new message
+- **THEN** it does not begin, commit or roll back a transaction
+- **AND** another connection cannot see the row before the caller commits
 
-### Requirement: Couple the claim to the domain transaction
+### Requirement: Give every message its own READ COMMITTED transaction
 
-The idempotency insert and every domain effect caused by one inbound message
-MUST execute in the same database transaction. The idempotency repository MUST
-NOT commit independently.
+Every message produced by the authenticated inbound parser MUST be processed
+with a new SQLAlchemy Session and its own PostgreSQL transaction. The
+transaction isolation level MUST be explicitly `READ COMMITTED`, not merely
+assumed from the database server default (`D-32`).
+
+#### Scenario: Isolation is fixed by the webhook orchestration
+
+- **WHEN** the handler runs for a newly claimed message
+- **THEN** `SHOW transaction_isolation` in that same transaction reports
+  `read committed`
+
+#### Scenario: Two messages from one webhook use independent transactions
+
+- **GIVEN** one authenticated webhook yields two new messages
+- **WHEN** both are processed successfully
+- **THEN** each claim and handler effect commits in its own transaction
+- **AND** neither message reuses the other message's Session or transaction
+
+### Requirement: Bind the handler to the claim transaction
+
+For a claimed message, the orchestration MUST build an injected handler from a
+factory bound to the same Session that performed the claim. The handler MUST
+apply its database effects through dependencies bound to that Session and MUST
+return descriptive post-commit actions without executing external I/O.
+
+The handler and its repositories MUST NOT begin, commit or roll back the
+transaction. The handler MUST NOT receive a raw dictionary as its validated
+message input.
 
 #### Scenario: Processing succeeds
 
-- **WHEN** a new message is claimed and its domain processing succeeds
-- **THEN** the claim and all domain changes commit together
+- **WHEN** a new message is claimed and its handler succeeds
+- **THEN** the handler is invoked exactly once
+- **AND** the claim and every database effect of the handler commit together
+- **AND** the returned actions are retained for dispatch after commit
+
+#### Scenario: Duplicate stops before the handler boundary
+
+- **WHEN** the claim reports a committed duplicate
+- **THEN** the handler factory is not used
+- **AND** the handler is not invoked
+- **AND** no handler effect or post-commit action is repeated
+
+#### Scenario: Handler cannot dispatch before commit
+
+- **WHEN** the handler returns one or more external actions
+- **THEN** no dispatcher is invoked while the message transaction is active
+
+### Requirement: Roll back the claim with handler effects
+
+The idempotency claim and every transactional handler effect caused by one
+inbound message MUST execute in the same database transaction.
 
 #### Scenario: Processing fails after the claim
 
-- **WHEN** an exception occurs after claiming a new message but before commit
-- **THEN** the claim and all partial domain changes roll back together
+- **WHEN** the handler raises after claiming a new message but before commit
+- **THEN** the claim and all partial handler changes roll back together
+- **AND** no post-commit action for that processing is dispatched
 - **AND** the webhook responds with a 5xx status
 - **AND** a later retry can claim and process the same `message_id`
 
-### Requirement: Preserve the global lock order
+#### Scenario: Retry after rollback succeeds once
 
-Inbound processing MUST acquire database coordination points in this order:
+- **GIVEN** a first attempt for a `message_id` rolled back after the claim
+- **WHEN** the same message is retried and its handler succeeds
+- **THEN** the retry reports claimed
+- **AND** exactly one committed claim and one committed handler effect exist
 
-1. idempotency insert;
-2. `SELECT ... FOR UPDATE` of the customer's Conversation;
-3. any required `SELECT ... FOR UPDATE` of Order or Reservation.
+### Requirement: Preserve the lock-order extension point
 
-#### Scenario: Process a new domain message
+The idempotency claim MUST complete before the transaction-bound handler is
+constructed or invoked. A duplicate MUST stop before that handler boundary.
 
-- **WHEN** a new inbound message requires Conversation and Order state
-- **THEN** the idempotency insert occurs before the Conversation lock
-- **AND** the Conversation lock occurs before the Order lock
+The real `SELECT ... FOR UPDATE` locks for Conversation, Order and Reservation
+are deferred to `add-conversation-state-machine`. That change MUST preserve the
+full normative order of `CONV-9`: idempotency claim, Conversation lock, then
+Order or Reservation lock.
 
-#### Scenario: Stop a duplicate early
+#### Scenario: Claimed message reaches the handler after the insert
 
-- **WHEN** the idempotency insert identifies a duplicate
-- **THEN** processing stops before acquiring the Conversation lock
-- **AND** no Order or Reservation lock is acquired
+- **WHEN** a new message reaches the transaction-bound handler
+- **THEN** its idempotency row has already been inserted in that transaction
 
-### Requirement: Verify the webhook signature before claiming
+#### Scenario: Duplicate cannot acquire later domain locks
 
-The webhook MUST validate the `X-Hub-Signature-256` signature before opening
-message processing or writing an idempotency row.
+- **WHEN** the claim reports duplicate
+- **THEN** processing stops before the handler boundary
+- **AND** code responsible for Conversation, Order or Reservation locks cannot
+  be invoked
 
-#### Scenario: Reject an invalid signature
+### Requirement: Resolve concurrent delivery in PostgreSQL
 
-- **WHEN** an inbound webhook has an invalid signature
-- **THEN** the endpoint responds with HTTP 403
-- **AND** no processed-message row is inserted
-- **AND** no domain effect occurs
+Concurrent idempotency behavior MUST be verified with real parallel execution
+against PostgreSQL. A sequential pair of calls MUST NOT be accepted as the
+concurrency proof.
 
-### Requirement: Process batched messages independently
+#### Scenario: Receive the same message concurrently
 
-When one webhook payload contains multiple inbound messages, the system MUST
-process each `message_id` in its own database transaction.
+- **GIVEN** no committed row exists for a `message_id`
+- **WHEN** two threads with independent PostgreSQL connections and transactions
+  attempt to process it at the same time
+- **THEN** PostgreSQL allows at most one transaction to commit the claim
+- **AND** exactly one transaction commits the handler effect
+- **AND** the other transaction resolves as duplicate after the winner commits
 
-#### Scenario: One message in a batch fails
+#### Scenario: Concurrent winner rolls back
 
-- **WHEN** earlier messages in a batch commit successfully
-- **AND** a later message fails before commit
-- **THEN** the successful messages remain committed
-- **AND** the failed message leaves no committed claim or partial domain effect
-- **AND** the webhook responds with a 5xx status
+- **GIVEN** one transaction has inserted the claim without committing
+- **AND** a second independent transaction is waiting for the same
+  `message_id`
+- **WHEN** the first transaction rolls back
+- **THEN** the waiting transaction can claim and process the message
+- **AND** exactly one claim and one handler effect are ultimately committed
 
-#### Scenario: Retry a partially successful batch
+### Requirement: Verify the migration in a dedicated PostgreSQL test database
 
-- **WHEN** Meta retries a partially successful batch
-- **THEN** previously committed message IDs resolve as duplicates
-- **AND** the rolled-back message can be claimed and processed again
+The Alembic revision that introduces `processed_whatsapp_messages` MUST be
+tested in the dedicated migration database. The test MUST exercise upgrade
+from its direct parent, inspect the complete table contract and downgrade back
+to that parent without altering any other table.
 
-### Requirement: Dispatch external effects after commit
+#### Scenario: Upgrade creates the exact table
 
-WhatsApp responses and staff notifications MUST be dispatched only after the
-database transaction commits.
+- **WHEN** the migration upgrades from revision `88d85f44fb7d` to
+  `57f88cf9ee63`
+- **THEN** the table has a `TEXT` primary key `message_id`
+- **AND** `received_at` is non-null `TIMESTAMPTZ` with a server-side
+  `now()` default
+- **AND** no other table is added, dropped or changed by that revision
 
-#### Scenario: Transaction rolls back
+#### Scenario: Downgrade removes only the processed-message table
 
-- **WHEN** inbound processing rolls back
-- **THEN** no WhatsApp response or staff notification for that processing is
-  dispatched
+- **WHEN** revision `57f88cf9ee63` is downgraded to `88d85f44fb7d`
+- **THEN** `processed_whatsapp_messages` no longer exists
+- **AND** the schema that existed at the parent revision is otherwise intact
 
-#### Scenario: Transaction commits
+### Requirement: Complete idempotency verification uses PostgreSQL
 
-- **WHEN** inbound processing commits
-- **THEN** external dispatch may begin after the commit completes
-
-#### Scenario: Process crashes after commit and before dispatch
-
-- **WHEN** the database transaction commits
-- **AND** the process crashes before an external dispatch completes
-- **THEN** the committed `message_id` remains deduplicated
-- **AND** the system does not claim exactly-once external delivery
-
-### Requirement: Return stable webhook outcomes
-
-The webhook MUST return HTTP 200 without a useful response body for a
-successfully processed message and for a committed duplicate. It MUST return
-HTTP 403 for an invalid signature and a 5xx status for a processing failure
-that rolled back.
-
-#### Scenario: Receive a committed duplicate
-
-- **WHEN** a duplicate `message_id` is detected
-- **THEN** the endpoint responds with HTTP 200
-- **AND** it does not repeat domain or external effects
-
-### Requirement: Log idempotency outcomes without PII
-
-The system MAY log the `message_id`, processing duration and an outcome of
-`claimed`, `duplicate` or `rolled_back`. It MUST NOT log the full webhook
-payload, message body, complete phone number or delivery address.
-
-#### Scenario: Processing fails
-
-- **WHEN** message processing raises an error
-- **THEN** the failure log can be correlated by `message_id`
-- **AND** it contains no webhook payload or customer PII
-
-### Requirement: Verify idempotency against PostgreSQL
-
-Idempotency and concurrency tests MUST run against PostgreSQL rather than
-SQLite.
+Repository, transaction, rollback and concurrency integration tests MUST run
+against PostgreSQL rather than SQLite. Migration tests that reset a schema MUST
+run only against the dedicated database whose verified name ends in `_test`.
 
 #### Scenario: Complete idempotency verification
 
 - **WHEN** the change verification suite runs
-- **THEN** it covers sequential duplicates, concurrent claims, rollback and
-  retry, invalid signatures and partial batch retry against PostgreSQL
-- **AND** the complete `run-verify` workflow is green before closing the change
+- **THEN** it covers a new claim, sequential duplicate, concurrent claim,
+  rollback and retry, concurrent winner rollback and shared handler transaction
+  against PostgreSQL
+- **AND** no concurrency scenario is implemented as sequential calls
+- **AND** the complete verification workflow is green before closing the
+  change
