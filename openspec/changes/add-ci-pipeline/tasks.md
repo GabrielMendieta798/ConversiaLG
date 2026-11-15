@@ -68,5 +68,6 @@ without touching them, stop and propose a new scenario (`SDD-2`).
 
 ## 7. Close
 
-- [ ] 7.1 Lautaro/Gabriel configure branch protection on `develop` and `main` requiring the check and one approved review; record it was done.
-- [ ] 7.2 Add to `ESTADO.md` only the line for this change, without touching other outdated entries, and add the README log entry (`SDD-5`).
+- [x] 7.1 Lautaro/Gabriel configure branch protection on `develop` and `main` requiring the check and one approved review; record it was done.
+  - branch protection configurada por gabriel, 14/11 , en develop y main, con el check verify y una aprobación requeridos.
+- [x] 7.2 Add to `ESTADO.md` only the line for this change, without touching other outdated entries, and add the README log entry (`SDD-5`).

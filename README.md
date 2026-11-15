@@ -206,3 +206,29 @@ hacerlo en GitHub.
 **Verificación.** `run-verify` en verde: Ruff check y format, mypy estricto sobre 24 archivos, 92 tests unitarios y 8 de integración. Siete escenarios de integración prueban upgrade, datos relacionados, constraints, generación de IDs más allá de `INTEGER`, enforcement de FK, downgrade válido y rechazo atómico por overflow.
 
 **Casos de uso cubiertos.** Ninguno de negocio. Se cubre la capacidad técnica de almacenamiento y generación de identificadores internos en PostgreSQL.
+
+### 11–14/11/2026 — `add-ci-pipeline`
+
+**Qué se hizo.** Cada Pull Request hacia `develop` o `main` pasa por el workflow `ci` (`.github/workflows/ci.yml`), un único job `verify` de 13 pasos. Arranca con una compuerta de marcadores de conflicto, sigue con uv y Python 3.12 fijados, el chequeo del lockfile y `uv sync --frozen`. Después corren los cinco pasos de `run-verify`: lint, format, mypy, unit e integración. Antes de integración se preparan un rol sin superusuario y las bases `bot_resto_ci` y `bot_resto_ci_test` sobre `postgres:16.15`, y se aplica `alembic upgrade head`. Al final se verifica que la base de la app quedó intacta. El token solo lee, no hay secrets de GitHub y las corridas viejas del mismo PR se cancelan. El README ganó la sección "CI" con la reproducción local y la branch protection como paso manual. Sin cambios en `backend/`, `tests/`, `config/`, `pyproject.toml` ni `uv.lock`.
+
+**Prompt usado.** `/opsx:propose`: [COMPLETAR: prompt original de propose]. Después, `/opsx:apply add-ci-pipeline` grupo por grupo ("Trabajá SOLO el grupo N"), con la verificación del CI después de cada tarea y frenando en el primer rojo. Los commits los hizo Lautaro. Para la 6.1 se corrió la verificación local junto con una revisión de solo lectura del subagente `security`. Las tareas 6.2 a 6.6 se verificaron en GitHub y se registraron a partir de esos resultados.
+
+**Ajustes realizados durante el apply.**
+- **Imagen de PostgreSQL:** `postgres:16.15`, el último tag de la rama 16 que existía (verificado con `docker manifest inspect`; 16.16 todavía no estaba). La base local de desarrollo usa 16.13.
+- **Verificación por marker:** como corre el CI, unit e integración van en procesos separados (ver el hallazgo de abajo).
+- **Validación local de los pasos de base, migración e integridad** contra un contenedor descartable en el puerto 55432, nunca contra la base de desarrollo. El chequeo de base intacta se probó también con la revisión cambiada y con el esquema borrado: falló en los dos casos.
+
+**Lo que corrigió el loop de `run-verify` y de la verificación.**
+- **Logging apagado por Alembic (hallazgo abierto, no corregido).** `uv run pytest` sin marker, en un solo proceso, falla en 9 tests unitarios de logging. `test_bigint_migration.py` corre Alembic dentro del proceso, y `backend/alembic/env.py:25` llama a `fileConfig` con el default `disable_existing_loggers=True`, que deshabilita los loggers de la app para el resto de la sesión. Quedó documentado. No se arregló porque `backend/` está fuera del alcance (`SDD-3`).
+- **Base de desarrollo apagada.** Dos veces `pytest -m integration` encontró `bot-resto-db` detenido. Se frenó y se esperó a que Lautaro la levantara; no fue un problema del workflow.
+
+**Verificación.**
+- **Local (6.1):** ruff, format, mypy estricto (35 archivos), 242 tests unitarios y 41 de integración.
+- **GitHub, PR #30 a `develop` (corrida #2):** los 20 pasos del job en verde.
+- **Borrador #31, cerrado sin mergear:** cada caso falló en el paso previsto, sin ejecutar los siguientes. Los casos fueron lint, formato, mypy, test unitario, test de integración, marcador de conflicto, lockfile desfasado y base inalcanzable.
+- **Reproducibilidad:** el re-run del mismo commit dio el mismo resultado, y un push seguido canceló la corrida anterior.
+- **Integración en CI:** los 7 tests de migración pasaron con el rol sin superusuario, y "Application database intact" dio verde.
+- **Seguridad:** el subagente `security` dio 0 altos, 0 medios y 0 bajos, con 5 notas informativas.
+- **Branch protection:** la configuró Gabriel el 14/11 en `develop` y `main`.
+
+**Casos de uso cubiertos.** Ninguno de negocio. Se cubre la verificación automática y obligatoria de cada Pull Request.

@@ -32,6 +32,7 @@ Fase actual: **capa de dominio de menú y customers archivada e integrada, y mig
 - [x] `add-application-skeleton` — archivado el 03/10/2026 (PRs #20 a #23)
 - [x] `add-menu-and-customer-repositories` — archivado el 10/10/2026 e integrado mediante el PR #24
 - [x] `migrate-identifiers-to-bigint` — implementación y verificación completas el 11/10/2026; archive/PR pendientes
+- [x] `add-ci-pipeline` — 22/22 tareas y archivado el 14/11/2026. El workflow `ci` (`.github/workflows/ci.yml`, job `verify`) corre en cada PR hacia `develop` y `main` contra `postgres:16.15`, y se verificó en GitHub en los PRs #30 (verde) y #31 (borrador con 8 casos rotos, cerrado sin mergear). El 14/11 Gabriel configuró la branch protection en `develop` y `main` (exige `verify` y una aprobación). Hallazgo abierto: `backend/alembic/env.py:25` (`fileConfig` sin `disable_existing_loggers=False`) hace fallar 9 tests unitarios si `uv run pytest` corre sin marker, en un solo proceso.
 
 ## Próximo paso
 
