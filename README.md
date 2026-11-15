@@ -2,6 +2,134 @@
 
 WhatsApp bot for restaurants built with FastAPI and PostgreSQL.
 
+## CI
+
+Cada Pull Request hacia `develop` o `main` corre el workflow `ci`
+(`.github/workflows/ci.yml`), con un único job `verify`. Corre al abrir el PR,
+con cada commit nuevo y al reabrirlo. Si llega un commit nuevo mientras una
+corrida del mismo PR sigue en curso, esa corrida se cancela. El workflow solo
+lee el repo (`permissions: contents: read`): no despliega, no publica y no
+escribe ramas. No usa secrets de GitHub; las credenciales que declara son de
+prueba y valen solo para el contenedor de PostgreSQL de esa corrida.
+
+### Qué corre y en qué orden
+
+El job corre en `ubuntu-24.04` con un tope de 20 minutos. Los pasos van en
+orden, y el primero que falla corta el job: los siguientes quedan salteados.
+
+| # | Paso | Qué hace |
+|---|------|----------|
+| 1 | `Checkout` | `actions/checkout` fijado por SHA, sin dejar el token en `.git/config`. |
+| 2 | `Conflict markers` | `git grep -nE '^(<{7}\|>{7})( \|$)' -- .`: falla si un archivo versionado tiene un marcador de conflicto de apertura (`<{7}`) o de cierre (`>{7}`) al inicio de línea, y lista archivo y línea. |
+| 3 | `Set up uv and Python 3.12` | `astral-sh/setup-uv` fijado por SHA, uv `0.11.21`, Python `3.12` y cache de descargas invalidada por `uv.lock`. |
+| 4 | `Lockfile in sync` | `uv lock --check`: falla si `uv.lock` no corresponde a `pyproject.toml`. |
+| 5 | `Install dependencies` | `uv sync --frozen`: instala exactamente lo que dice `uv.lock`. |
+| 6 | `Lint (ruff check)` | `uv run --frozen ruff check .` |
+| 7 | `Format (ruff format --check)` | `uv run --frozen ruff format --check .` |
+| 8 | `Typecheck (mypy backend/app)` | `uv run --frozen mypy backend/app` |
+| 9 | `Unit tests (pytest -m unit)` | `uv run --frozen pytest -m unit` |
+| 10 | `Create database role and databases` | Espera a PostgreSQL y, con el superusuario de bootstrap, crea el rol `bot_resto_ci` (sin superusuario, sin `CREATEDB`, sin `CREATEROLE`) y las bases `bot_resto_ci` y `bot_resto_ci_test`, ambas con ese rol como dueño. |
+| 11 | `Apply migrations (alembic upgrade head)` | Desde `backend/`: `uv run --frozen alembic upgrade head` sobre `bot_resto_ci`. |
+| 12 | `Integration tests (pytest -m integration)` | `uv run --frozen pytest -m integration`. Los tests destructivos de migración usan `bot_resto_ci_test`. |
+| 13 | `Application database intact` | Como `bot_resto_ci`, confirma que `bot_resto_ci` sigue en el head de Alembic y conserva `alembic_version`, `customers` y `menu_items`. |
+
+Los pasos 6, 7, 8, 9 y 12 son los cinco de `run-verify`, en el mismo orden.
+
+La base es un service container `postgres:16.15` con healthcheck
+`pg_isready`, creado para la corrida y descartado al terminar. El job le pasa
+a todos los pasos `APP_ENV=test` y
+`DATABASE_URL=postgresql+psycopg://bot_resto_ci:ci_test_only_password@localhost:5432/bot_resto_ci`.
+
+### Reproducirlo en local
+
+Los comandos son de bash (en Windows, Git Bash) y se corren desde la raíz del
+repo. Necesitan Docker, uv y el cliente `psql`. La base es un contenedor
+descartable en el puerto `55432`, para no chocar con la base de desarrollo.
+
+1. Levantar PostgreSQL con la misma imagen y el mismo bootstrap que el CI:
+
+   ```bash
+   docker run --rm -d --name bot-resto-ci-local \
+     -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=ci_bootstrap_test_password \
+     -p 55432:5432 postgres:16.15
+   ```
+
+2. Exportar el mismo entorno que el job, cambiando solo el puerto. Las
+   variables del proceso tienen prioridad sobre el `.env`:
+
+   ```bash
+   export APP_ENV=test
+   export DATABASE_URL=postgresql+psycopg://bot_resto_ci:ci_test_only_password@localhost:55432/bot_resto_ci
+   ```
+
+3. Correr los pasos en el orden del CI, y frenar en el primero que falle:
+
+   ```bash
+   git grep -nE '^(<{7}|>{7})( |$)' -- .   # tiene que salir vacío
+   uv lock --check
+   uv sync --frozen
+   uv run --frozen ruff check .
+   uv run --frozen ruff format --check .
+   uv run --frozen mypy backend/app
+   uv run --frozen pytest -m unit
+   ```
+
+4. Crear el rol y las dos bases. Si `pg_isready` no da `accepting
+   connections`, esperar unos segundos y repetir:
+
+   ```bash
+   PGPASSWORD=ci_bootstrap_test_password pg_isready -h localhost -p 55432 -U postgres
+   PGPASSWORD=ci_bootstrap_test_password psql -h localhost -p 55432 -U postgres \
+     -d postgres -v ON_ERROR_STOP=1 <<'SQL'
+   CREATE ROLE bot_resto_ci LOGIN PASSWORD 'ci_test_only_password'
+     NOSUPERUSER NOCREATEDB NOCREATEROLE;
+   CREATE DATABASE bot_resto_ci OWNER bot_resto_ci;
+   CREATE DATABASE bot_resto_ci_test OWNER bot_resto_ci;
+   SQL
+   ```
+
+5. Aplicar las migraciones, correr la suite de integración y comprobar que la
+   base de la app quedó intacta:
+
+   ```bash
+   (cd backend && uv run --frozen alembic upgrade head)
+   uv run --frozen pytest -m integration
+   (cd backend && uv run --frozen alembic heads)    # el head esperado
+   psql "${DATABASE_URL/+psycopg/}" -At \
+     -c "SELECT version_num FROM alembic_version" \
+     -c "SELECT to_regclass('public.customers'), to_regclass('public.menu_items')"
+   ```
+
+   `version_num` tiene que coincidir con el head, y las dos tablas tienen que
+   aparecer con su nombre, no vacías.
+
+6. Borrar la base descartable:
+
+   ```bash
+   docker stop bot-resto-ci-local
+   ```
+
+Corré `pytest -m unit` y `pytest -m integration` por separado, como el CI. Hoy
+`uv run pytest` sin marker, en un solo proceso, falla en 9 tests unitarios de
+logging: `backend/alembic/env.py` llama a `fileConfig` sin
+`disable_existing_loggers=False` y apaga los loggers de la app cuando los tests
+de migración corren antes que los unitarios. Es un hallazgo abierto, ajeno a
+este CI.
+
+### Branch protection (paso manual en GitHub)
+
+El workflow corre en cada PR, pero no bloquea el merge por sí solo. Para que
+el check sea obligatorio, alguien con permisos de administración del repo
+tiene que configurarlo a mano en GitHub (Settings → Branches o Rules), en
+`develop` y en `main`:
+
+- exigir que el status check `verify` pase antes de mergear (en el PR aparece
+  como `ci / verify`);
+- exigir al menos una revisión aprobada.
+
+Esta configuración no está versionada en el repo: si se cambia, hay que
+hacerlo en GitHub.
+
 ## Bitácora
 
 ### 02–03/10/2026 — `add-application-skeleton`
@@ -78,3 +206,29 @@ WhatsApp bot for restaurants built with FastAPI and PostgreSQL.
 **Verificación.** `run-verify` en verde: Ruff check y format, mypy estricto sobre 24 archivos, 92 tests unitarios y 8 de integración. Siete escenarios de integración prueban upgrade, datos relacionados, constraints, generación de IDs más allá de `INTEGER`, enforcement de FK, downgrade válido y rechazo atómico por overflow.
 
 **Casos de uso cubiertos.** Ninguno de negocio. Se cubre la capacidad técnica de almacenamiento y generación de identificadores internos en PostgreSQL.
+
+### 11–14/11/2026 — `add-ci-pipeline`
+
+**Qué se hizo.** Cada Pull Request hacia `develop` o `main` pasa por el workflow `ci` (`.github/workflows/ci.yml`), un único job `verify` de 13 pasos. Arranca con una compuerta de marcadores de conflicto, sigue con uv y Python 3.12 fijados, el chequeo del lockfile y `uv sync --frozen`. Después corren los cinco pasos de `run-verify`: lint, format, mypy, unit e integración. Antes de integración se preparan un rol sin superusuario y las bases `bot_resto_ci` y `bot_resto_ci_test` sobre `postgres:16.15`, y se aplica `alembic upgrade head`. Al final se verifica que la base de la app quedó intacta. El token solo lee, no hay secrets de GitHub y las corridas viejas del mismo PR se cancelan. El README ganó la sección "CI" con la reproducción local y la branch protection como paso manual. Sin cambios en `backend/`, `tests/`, `config/`, `pyproject.toml` ni `uv.lock`.
+
+**Prompt usado.** `/opsx:propose`: [COMPLETAR: prompt original de propose]. Después, `/opsx:apply add-ci-pipeline` grupo por grupo ("Trabajá SOLO el grupo N"), con la verificación del CI después de cada tarea y frenando en el primer rojo. Los commits los hizo Lautaro. Para la 6.1 se corrió la verificación local junto con una revisión de solo lectura del subagente `security`. Las tareas 6.2 a 6.6 se verificaron en GitHub y se registraron a partir de esos resultados.
+
+**Ajustes realizados durante el apply.**
+- **Imagen de PostgreSQL:** `postgres:16.15`, el último tag de la rama 16 que existía (verificado con `docker manifest inspect`; 16.16 todavía no estaba). La base local de desarrollo usa 16.13.
+- **Verificación por marker:** como corre el CI, unit e integración van en procesos separados (ver el hallazgo de abajo).
+- **Validación local de los pasos de base, migración e integridad** contra un contenedor descartable en el puerto 55432, nunca contra la base de desarrollo. El chequeo de base intacta se probó también con la revisión cambiada y con el esquema borrado: falló en los dos casos.
+
+**Lo que corrigió el loop de `run-verify` y de la verificación.**
+- **Logging apagado por Alembic (hallazgo abierto, no corregido).** `uv run pytest` sin marker, en un solo proceso, falla en 9 tests unitarios de logging. `test_bigint_migration.py` corre Alembic dentro del proceso, y `backend/alembic/env.py:25` llama a `fileConfig` con el default `disable_existing_loggers=True`, que deshabilita los loggers de la app para el resto de la sesión. Quedó documentado. No se arregló porque `backend/` está fuera del alcance (`SDD-3`).
+- **Base de desarrollo apagada.** Dos veces `pytest -m integration` encontró `bot-resto-db` detenido. Se frenó y se esperó a que Lautaro la levantara; no fue un problema del workflow.
+
+**Verificación.**
+- **Local (6.1):** ruff, format, mypy estricto (35 archivos), 242 tests unitarios y 41 de integración.
+- **GitHub, PR #30 a `develop` (corrida #2):** los 20 pasos del job en verde.
+- **Borrador #31, cerrado sin mergear:** cada caso falló en el paso previsto, sin ejecutar los siguientes. Los casos fueron lint, formato, mypy, test unitario, test de integración, marcador de conflicto, lockfile desfasado y base inalcanzable.
+- **Reproducibilidad:** el re-run del mismo commit dio el mismo resultado, y un push seguido canceló la corrida anterior.
+- **Integración en CI:** los 7 tests de migración pasaron con el rol sin superusuario, y "Application database intact" dio verde.
+- **Seguridad:** el subagente `security` dio 0 altos, 0 medios y 0 bajos, con 5 notas informativas.
+- **Branch protection:** la configuró Gabriel el 14/11 en `develop` y `main`.
+
+**Casos de uso cubiertos.** Ninguno de negocio. Se cubre la verificación automática y obligatoria de cada Pull Request.
