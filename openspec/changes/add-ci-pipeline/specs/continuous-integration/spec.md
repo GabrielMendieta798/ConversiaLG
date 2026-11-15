@@ -90,8 +90,7 @@ Before the suite starts, the check SHALL wait until the database accepts
 connections, SHALL create the application database and its twin
 `<application database>_test`, both owned by the role the tests connect with,
 and SHALL apply every Alembic migration up to head on the application
-database. An unreachable database SHALL fail the check; integration tests
-SHALL never be reported as skipped or passed without a database.
+database.
 
 #### Scenario: Broken integration test
 
@@ -100,6 +99,18 @@ SHALL never be reported as skipped or passed without a database.
 - **WHEN** the check runs
 - **THEN** the check fails at the integration step
 
+#### Scenario: Migrations applied before the suite
+
+- **WHEN** the integration suite starts
+- **THEN** the application database is at the Alembic head revision
+- **AND** the `<application database>_test` database exists and is owned by
+  the same role
+
+### Requirement: An unreachable database fails the check
+
+An unreachable database SHALL fail the check; integration tests
+SHALL never be reported as skipped or passed without a database.
+
 #### Scenario: Database unreachable
 
 - **GIVEN** the database the integration suite is configured to use does not
@@ -107,13 +118,6 @@ SHALL never be reported as skipped or passed without a database.
 - **WHEN** the check runs
 - **THEN** the check fails
 - **AND** no integration test is reported as passed or skipped
-
-#### Scenario: Migrations applied before the suite
-
-- **WHEN** the integration suite starts
-- **THEN** the application database is at the Alembic head revision
-- **AND** the `<application database>_test` database exists and is owned by
-  the same role
 
 ### Requirement: Destructive migration tests never touch the application database
 
@@ -146,11 +150,6 @@ starts with a conflict opening marker (the regular expression `<{7}`: seven
 A real conflict always leaves both. The failure SHALL name every offending
 file and line.
 
-No file of this change (spec, design, `README`, workflow definition) SHALL
-contain either marker literally at the start of a line: wherever the markers
-must be named, they SHALL be written as a quantified pattern, so the check
-never fails on its own definition.
-
 #### Scenario: File with conflict markers
 
 - **GIVEN** a Pull Request where a tracked file contains a line starting with
@@ -166,6 +165,13 @@ never fails on its own definition.
   closing marker
 - **WHEN** the check runs
 - **THEN** the conflict-marker step passes
+
+### Requirement: The conflict-marker check never flags its own definition
+
+No file of this change (spec, design, `README`, workflow definition) SHALL
+contain either marker literally at the start of a line: wherever the markers
+must be named, they SHALL be written as a quantified pattern, so the check
+never fails on its own definition.
 
 #### Scenario: The check does not flag its own definition
 
