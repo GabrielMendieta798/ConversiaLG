@@ -108,20 +108,47 @@ def test_available_items_are_filtered_and_ordered_by_name_then_id(
 def test_order_follows_the_database_collation(
     repo: SqlMenuRepository, db_session: Session, make_item: MakeItem, category: str
 ) -> None:
-    collation = db_session.execute(
-        text("SELECT datcollate FROM pg_database WHERE datname = current_database()")
-    ).scalar_one()
-    # El orden esperado asume la collation de desarrollo (design, Risks).
-    assert collation.startswith("en_US"), f"expected en_US collation, got {collation}"
-    for name in ("Ravioles", "Ñoquis", "Nuez", "Orecchiette"):
+    sensitive_names = ("Ravioles", "Ñoquis", "Nuez", "Orecchiette")
+    for name in sensitive_names:
         make_item(name)
+
+    expected_rows = db_session.execute(
+        text(
+            """
+            SELECT name, pg_collation_for(name)::text AS collation
+            FROM (
+                VALUES
+                    (CAST(:ravioles AS VARCHAR(150))),
+                    (CAST(:noquis AS VARCHAR(150))),
+                    (CAST(:nuez AS VARCHAR(150))),
+                    (CAST(:orecchiette AS VARCHAR(150)))
+            ) AS expected(name)
+            ORDER BY name
+            """
+        ),
+        {
+            "ravioles": sensitive_names[0],
+            "noquis": sensitive_names[1],
+            "nuez": sensitive_names[2],
+            "orecchiette": sensitive_names[3],
+        },
+    ).all()
+    column_collation = db_session.execute(
+        text(
+            """
+            SELECT pg_collation_for(name)::text
+            FROM menu_items
+            WHERE category = :category
+            LIMIT 1
+            """
+        ),
+        {"category": category},
+    ).scalar_one()
+    assert {row.collation for row in expected_rows} == {column_collation}
 
     names = [item.name for item in repo.list_available_items(category)]
 
-    # glibc en_US trata la Ñ como una N acentuada ("Noquis" < "Nuez"). Una
-    # collation española (es-AR-x-icu) la ordena como letra aparte, después de
-    # la N: "Nuez" < "Ñoquis". Hoy rige la de la base (design D7).
-    assert names == ["Ñoquis", "Nuez", "Orecchiette", "Ravioles"]
+    assert names == [row.name for row in expected_rows]
 
 
 def test_unknown_category_is_an_empty_list(
