@@ -18,6 +18,14 @@ COMPOSE_FILE = PROJECT_ROOT / "docker-compose.yml"
 CI_WORKFLOW = PROJECT_ROOT / ".github" / "workflows" / "ci.yml"
 DATA_DIRECTORY = "/var/lib/postgresql/data"
 INIT_SCRIPT = "./docker/postgres/init/10-create-app-role-and-databases.sh"
+INIT_SCRIPT_FILE = PROJECT_ROOT / INIT_SCRIPT
+ROLE_ATTRIBUTES = (
+    "LOGIN",
+    "NOSUPERUSER",
+    "NOCREATEDB",
+    "NOCREATEROLE",
+    "NOREPLICATION",
+)
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -135,6 +143,113 @@ def test_healthcheck_connects_over_tcp_as_the_app_role_to_the_twin(
     assert "-h 127.0.0.1" in command
     assert '-U "$$POSTGRES_APP_USER"' in command
     assert '-d "$${POSTGRES_APP_DB}_test"' in command
+
+
+def test_healthcheck_reads_the_password_with_the_doubled_dollar(
+    db_service: dict[str, Any],
+) -> None:
+    command = " ".join(db_service["healthcheck"]["test"])
+
+    # Con un solo `$`, Compose interpola la clave y la escribe en la definición
+    # del healthcheck (`docker inspect`, `docker compose config`): SEC-2.
+    assert 'PGPASSWORD="$$POSTGRES_APP_PASSWORD"' in command
+    single_dollar = re.findall(r"(?<!\$)\$(?=[{A-Za-z_])", command)
+    assert single_dollar == [], "healthcheck has a single `$` before a variable"
+
+
+# --- Forma del archivo ---------------------------------------------------------
+
+
+def test_no_service_declares_network_mode(compose: dict[str, Any]) -> None:
+    # `network_mode: host` ignora `ports` y expone la base en todas las
+    # interfaces del host.
+    for name, service in compose["services"].items():
+        assert "network_mode" not in service, f"service {name!r} sets network_mode"
+
+
+def test_compose_has_exactly_the_db_service_and_the_pgdata_volume(
+    compose: dict[str, Any],
+) -> None:
+    # Los guards de puerto y de volumen miran `db` y `pgdata`: cualquier otro
+    # servicio o volumen quedaría fuera de ellos.
+    assert set(compose["services"]) == {"db"}
+    assert set(compose["volumes"]) == {"pgdata"}
+
+
+# --- Script de init --------------------------------------------------------------
+
+
+def _init_script() -> str:
+    return INIT_SCRIPT_FILE.read_text(encoding="utf-8")
+
+
+def _heredoc(script: str) -> tuple[str, str]:
+    """Devuelve la comilla del delimitador (`''` si no tiene) y el bloque SQL."""
+    match = re.search(
+        r"<<-?\s*(['\"]?)SQL\1[^\n]*\n(.*?)\n\s*SQL\s*$", script, re.S | re.M
+    )
+    assert match, "init script has no SQL heredoc"
+    return match.group(1), match.group(2)
+
+
+def _sql_statements(sql: str) -> list[str]:
+    # Sin comentarios y sin meta-órdenes de psql (`\getenv …`), que no terminan
+    # en `;` y quedarían pegadas a la sentencia siguiente.
+    without_comments = re.sub(r"--[^\n]*|^\s*\\[^\n]*", "", sql, flags=re.M)
+    return [
+        " ".join(statement.split())
+        for statement in without_comments.split(";")
+        if statement.strip()
+    ]
+
+
+def test_init_role_has_every_minimum_privilege_attribute() -> None:
+    _, sql = _heredoc(_init_script())
+    roles = [s for s in _sql_statements(sql) if s.startswith("CREATE ROLE ")]
+
+    assert len(roles) == 1
+    # Uno por uno: `PASSWORD :'app_password'` queda entre los atributos.
+    tokens = set(roles[0].split())
+    for attribute in ROLE_ATTRIBUTES:
+        assert attribute in tokens, f"CREATE ROLE lacks {attribute}"
+
+
+def test_init_creates_exactly_the_two_databases_owned_by_the_app_role() -> None:
+    _, sql = _heredoc(_init_script())
+    databases = [s for s in _sql_statements(sql) if s.startswith("CREATE DATABASE ")]
+
+    assert databases == [
+        'CREATE DATABASE :"app_db" OWNER :"app_user"',
+        'CREATE DATABASE :"app_test_db" OWNER :"app_user"',
+    ]
+
+
+def test_init_creates_no_schema_object_and_grants_nothing() -> None:
+    # El esquema sale solo de Alembic (DAT-6).
+    forbidden = re.findall(
+        r"\bCREATE\s+(?:TABLE|SCHEMA|EXTENSION)\b|\bGRANT\b",
+        _init_script(),
+        re.I,
+    )
+
+    assert forbidden == [], f"init script contains {forbidden}"
+
+
+def test_init_never_passes_the_password_with_a_psql_variable_flag() -> None:
+    # `-v app_password=…` dejaría la clave en la línea de comando de psql,
+    # visible en /proc del contenedor (design D4).
+    assignments = re.findall(
+        r"(?:-v|--set|--variable)[\s=]+\S*password\S*=", _init_script(), re.I
+    )
+
+    assert assignments == []
+
+
+def test_init_sql_is_a_quoted_heredoc_without_shell_expansion() -> None:
+    quote, sql = _heredoc(_init_script())
+
+    assert quote in ("'", '"'), "SQL heredoc delimiter is not quoted"
+    assert "$" not in sql, "SQL block contains a `$` expansion"
 
 
 # --- La app no se ve afectada --------------------------------------------------
