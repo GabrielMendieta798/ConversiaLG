@@ -160,7 +160,7 @@ written only to env files inside `$VERIFY_DIR` and never printed or recorded.
     - `uv run mypy backend/app`: no issues found in 35 source files.
     - `uv run pytest -m unit`: 265 passed, 46 deselected.
     - `uv run pytest -m integration`: 46 passed, 265 deselected.
-- [ ] 4.6 Commit (Lautaro), before the archive. Paths: `README.md`, `ESTADO.md`, `openspec/changes/add-docker-compose-dev-db/tasks.md`. Message: `chore(add-docker-compose-dev-db): add development database README section, log entry and ESTADO update`.
+- [x] 4.6 Commit (Lautaro), before the archive. Paths: `README.md`, `ESTADO.md`, `openspec/changes/add-docker-compose-dev-db/tasks.md`. Message: `chore(add-docker-compose-dev-db): add development database README section, log entry and ESTADO update`.
 
 ## Workflow follow-up
 
