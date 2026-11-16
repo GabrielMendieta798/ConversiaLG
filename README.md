@@ -2,6 +2,209 @@
 
 WhatsApp bot for restaurants built with FastAPI and PostgreSQL.
 
+## Base de desarrollo local
+
+`docker-compose.yml` levanta una PostgreSQL de desarrollo con el mismo contrato
+que el CI: imagen `postgres:16.15`, un rol de la app sin privilegios
+(`NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION`) y dos bases de ese rol,
+la de la app y su gemela `<base>_test`, que usan los tests destructivos de
+migración. Solo crea eso: el esquema sale de Alembic, y las migraciones no
+corren solas al levantar la base.
+
+Los datos viven en el volumen nombrado `bot-resto-dev_pgdata`, fuera del repo.
+El puerto se publica solo en `127.0.0.1`, y el contenedor vuelve solo después
+de reiniciar Docker o la máquina (`restart: unless-stopped`).
+
+Los comandos son de PowerShell y se corren desde la raíz del repo. Necesitan
+Docker Desktop y uv.
+
+### Configuración (`.env`)
+
+Descomentá en tu `.env` el bloque "Base de desarrollo local" de `.env.example`
+y completá las dos claves. Con los defaults queda así (los valores de las
+claves no van en ningún archivo versionado):
+
+```dotenv
+POSTGRES_PASSWORD=<clave del superusuario de bootstrap>
+POSTGRES_APP_USER=bot_resto_user
+POSTGRES_APP_PASSWORD=<clave del rol de la app>
+POSTGRES_APP_DB=bot_resto
+POSTGRES_HOST_PORT=5433
+DATABASE_URL=postgresql+psycopg://bot_resto_user:<clave del rol de la app>@127.0.0.1:5433/bot_resto
+```
+
+- **Las dos claves son obligatorias y no tienen default.** Sin alguna,
+  `docker compose up` sale con código 1, nombra la variable que falta y no
+  crea nada.
+- **Tienen que ser distintas.** Quien conozca la clave de la app no debería
+  conocer también la del superusuario.
+- **Solo letras y números.** Ningún carácter que en una URL se codifique con
+  `%` (`@`, `/`, `:`, `%`, `#`, `?`, espacios): con esa URL, alembic falla y
+  muestra la URL completa, clave incluida (D-15). Para generar una:
+
+  ```powershell
+  $bytes = New-Object byte[] 16
+  [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+  ($bytes | ForEach-Object { $_.ToString('x2') }) -join ''
+  ```
+
+- **Reemplazá el `DATABASE_URL` que ya tenías** por el de arriba. No alcanza
+  con agregar las `POSTGRES_*`: si queda el viejo, la app y los tests siguen
+  apuntando a la base anterior.
+- **En `DATABASE_URL` va `127.0.0.1`, nunca `localhost`.** En Windows,
+  `localhost` resuelve primero a `::1` (IPv6), y el puerto se publica solo en
+  `127.0.0.1`: la conexión se cuelga sin dar error.
+- **La clave del rol va dos veces:** en `POSTGRES_APP_PASSWORD` y dentro de
+  `DATABASE_URL`. Si difieren, la app falla al conectar con un error de
+  autenticación.
+- **No definas `COMPOSE_PROJECT_NAME`** ni en el `.env` ni en el shell. Le
+  cambiaría el nombre al proyecto y al volumen, y la base "desaparecería"
+  (seguiría en el volumen viejo).
+- **`docker compose config` imprime las claves interpoladas.** Su salida no se
+  pega en ningún lado: ni en un issue, ni en un PR, ni en un chat (`SEC-2`).
+
+### Uso diario
+
+```powershell
+docker compose up -d --wait     # levanta y espera a que la base esté usable
+docker compose ps               # estado; tiene que decir "healthy"
+docker compose logs db          # logs del servicio
+docker compose stop             # la para sin borrar nada
+docker compose down             # borra el contenedor y la red, NO los datos
+```
+
+`up -d --wait` devuelve el control recién cuando el rol de la app puede
+conectarse por TCP a `<base>_test`, que es lo último que crea el
+inicializador. Si la base ya está corriendo, un segundo `up -d` no hace nada.
+
+Migraciones y tests contra esta base, con el `DATABASE_URL` del `.env`. Las
+dos suites van por separado, como en el CI:
+
+```powershell
+Push-Location backend; uv run alembic upgrade head; Pop-Location
+uv run pytest -m unit
+uv run pytest -m integration
+```
+
+Para mirar la base como superusuario por el socket del contenedor (no pide
+clave):
+
+```powershell
+docker compose exec db psql -U postgres -d bot_resto
+```
+
+### Cuándo corre el inicializador
+
+El script `docker/postgres/init/10-create-app-role-and-databases.sh` corre
+**una sola vez, con el volumen vacío**. Con datos presentes la imagen lo
+saltea (en los logs: "Skipping initialization"). Por eso:
+
+- **Cambiar una clave o un nombre en el `.env` después del primer arranque no
+  hace nada.** Para que tome efecto hay que resetear (ver abajo).
+- **Si el primer `up` falla** (`up --wait` sale con error, o el servicio queda
+  `unhealthy`), el volumen puede haber quedado inicializado pero sin el rol ni
+  las bases. Como los arranques siguientes saltean el inicializador, queda
+  `unhealthy` para siempre. Mirá la causa con `docker compose logs db`,
+  corregí el `.env` y recién ahí:
+
+  ```powershell
+  docker compose down -v
+  docker compose up -d --wait
+  ```
+
+  **Esto solo vale si todavía no restauraste ni cargaste ningún dato.** Si ya
+  hay datos, no es un volumen roto: es tu base, y `down -v` la borra.
+
+### Resetear: el único comando destructivo
+
+```powershell
+docker compose down -v
+```
+
+Borra el contenedor, la red **y el volumen `bot-resto-dev_pgdata` con todos
+los datos de desarrollo**: el esquema, y el menú o lo que hayas cargado a mano,
+que no tiene seed. No hay forma de recuperarlos. Antes, si te importa algo de
+lo que hay, sacá un dump fuera del repo:
+
+```powershell
+docker compose exec db pg_dump -U bot_resto_user -d bot_resto -Fc -f /tmp/bot_resto.dump
+docker compose cp db:/tmp/bot_resto.dump "$env:USERPROFILE\bot_resto.dump"
+```
+
+Después del reset, `docker compose up -d --wait` vuelve a crear el rol y las
+dos bases vacías, y hay que correr `alembic upgrade head` de nuevo.
+
+### Pasar del contenedor manual `bot-resto-db`
+
+El compose usa por default el mismo puerto (`5433`), así que los dos no pueden
+estar levantados a la vez. Las bases `botresto*` del contenedor viejo **no
+migran solas**: si no hacés el dump, la base nueva arranca vacía.
+
+1. *(Opcional, si querés conservar lo cargado a mano.)* Ver qué bases hay y
+   sacar un dump de la que uses, fuera del repo. `<usuario_viejo>` y
+   `<base_vieja>` son los de tu contenedor:
+
+   ```powershell
+   docker exec bot-resto-db psql -U <usuario_viejo> -d postgres -l
+   docker exec bot-resto-db pg_dump -U <usuario_viejo> -d <base_vieja> -Fc -f /tmp/botresto.dump
+   docker cp bot-resto-db:/tmp/botresto.dump "$env:USERPROFILE\botresto.dump"
+   ```
+
+   El dump se escribe dentro del contenedor y se copia con `docker cp`, sin
+   pasar por una redirección de PowerShell: `>` en PowerShell 5.1 reescribe
+   la salida como texto y rompe un dump binario.
+
+2. Anotar la política de reinicio del contenedor viejo, sacársela y pararlo.
+   Sin el `docker update`, vuelve a ocupar el `5433` al reiniciar Docker o la
+   máquina. No se borra: queda como respaldo.
+
+   ```powershell
+   docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' bot-resto-db
+   docker update --restart=no bot-resto-db
+   docker stop bot-resto-db
+   ```
+
+3. Configurar el `.env` (ver arriba) y levantar la base nueva:
+
+   ```powershell
+   docker compose up -d --wait
+   ```
+
+4. *(Solo si hiciste el paso 1.)* Restaurar el dump **sobre la base recién
+   creada y vacía**, como `bot_resto_user` por el socket del contenedor.
+   `--no-owner --no-privileges` deja todo a nombre del rol de la app, y
+   `--single-transaction --exit-on-error` hace que se cargue entero o nada:
+
+   ```powershell
+   docker compose cp "$env:USERPROFILE\botresto.dump" db:/tmp/botresto.dump
+   docker compose exec db pg_restore -U bot_resto_user -d bot_resto --no-owner --no-privileges --single-transaction --exit-on-error /tmp/botresto.dump
+   ```
+
+   Si falla, como fue en una sola transacción, la base sigue vacía: se puede
+   corregir y reintentar.
+
+5. **Recién después**, aplicar las migraciones. Si el dump venía de una
+   revisión anterior, esto la lleva al head; si ya estaba en el head, no hace
+   nada. Nunca al revés: con las migraciones ya aplicadas, el restore choca
+   con las tablas que existen.
+
+   ```powershell
+   Push-Location backend; uv run alembic upgrade head; Pop-Location
+   ```
+
+6. Comprobar que todo anda contra la base nueva:
+
+   ```powershell
+   uv run pytest -m unit
+   uv run pytest -m integration
+   ```
+
+Si algo sale mal, la vuelta atrás es `docker compose down` (sin `-v`), y después
+`docker start bot-resto-db` y `docker update --restart=<la política anotada en el paso 2> bot-resto-db`.
+
+Quien use un PostgreSQL nativo en el `5432` puede seguir con él: el compose no
+lo toca.
+
 ## CI
 
 Cada Pull Request hacia `develop` o `main` corre el workflow `ci`
@@ -232,3 +435,33 @@ hacerlo en GitHub.
 - **Branch protection:** la configuró Gabriel el 14/11 en `develop` y `main`.
 
 **Casos de uso cubiertos.** Ninguno de negocio. Se cubre la verificación automática y obligatoria de cada Pull Request.
+
+### 16/11/2026 — `add-docker-compose-dev-db`
+
+**Qué se hizo.** `docker compose up -d --wait` levanta la base de desarrollo con el mismo contrato que el CI: `postgres:16.15`, un rol `bot_resto_user` sin privilegios y las bases `bot_resto` y `bot_resto_test`, las dos de ese rol. Un script de init (`docker/postgres/init/`) crea solo eso, una única vez y con el volumen vacío; el esquema sigue saliendo de Alembic. El healthcheck se conecta por TCP como el rol de la app a la gemela `_test`, así que `healthy` significa que la base ya se puede usar. Los datos viven en un volumen nombrado acotado al proyecto (`bot-resto-dev_pgdata`), el puerto se publica solo en `127.0.0.1:5433` y el contenedor vuelve solo después de un reinicio. `.gitattributes` fuerza LF en los `.sh`. `.env.example` documenta las variables del compose solo como comentarios, y el README ganó la sección "Base de desarrollo local". 19 tests unitarios estáticos guardan el compose y el script. Sin cambios en `backend/`, `config/`, `pyproject.toml`, `uv.lock`, `ci.yml` ni en tests existentes.
+
+**Prompt usado.** `/opsx:propose add-docker-compose-dev-db`, con el contexto de negocio, el estado verificado del repo, el alcance, las decisiones que el design tenía que resolver, 18 escenarios obligatorios, los non-goals y, como punto de control humano, que ningún comando destructivo pudiera alcanzar el volumen de desarrollo. Después, `/opsx:apply add-docker-compose-dev-db` de a un grupo o una task por vez, frenando al final de cada uno. Los commits los hizo Lautaro.
+
+**Ajustes realizados durante el apply.**
+- **Clave fuera de la línea de comando:** el script de init lee las variables con `\getenv` de psql en lugar de `-v`, para que la clave del rol no quede en la línea de comando de `psql`, y fija `log_min_error_statement = panic` (design D4).
+- **Wrapper de verificación:** toda verificación que escribe o borra pasó por un `vc.sh` fuera del repo. Fija `-p bot-resto-verify`, el env file y `-f`, y rechaza cualquier `-p`, `-f`, `--env-file` o `--project-directory`. También limpia las variables `POSTGRES_*` y `COMPOSE_*` heredadas, solo deja correr `config` dentro de un pipe y solo apunta al puerto 55433.
+- **Escenario nuevo (`SDD-2`):** los 4 hallazgos bajos de la revisión de seguridad eran huecos de los tests estáticos. Se cerraron con tres requirements y 8 tests nuevos, sin tocar el compose ni el script.
+- **Hallazgos de la migración real (4.2), sumados al README:** con `localhost` en `DATABASE_URL`, la conexión se cuelga sin error, porque en Windows `localhost` resuelve primero a `::1` y el puerto se publica solo en `127.0.0.1`. Además, hay que reemplazar el `DATABASE_URL` viejo, no solo agregar las `POSTGRES_*`.
+
+**Verificación.**
+- **run-verify** en verde después de cada grupo: ruff, format, mypy estricto (35 archivos), 265 tests unitarios y 46 de integración.
+- **Runtime en el proyecto aislado `bot-resto-verify`** (puerto 55433, claves descartables):
+  - sin cada clave, `up` sale con 1 y no crea nada;
+  - el primer `up --wait` queda `healthy` después de que termina el init;
+  - el rol es `t|f|f|f|f` y `CREATE DATABASE` falla con `42501`;
+  - 0 tablas antes de migrar, `en_US.utf8`, `unless-stopped`;
+  - `alembic upgrade head` más la suite de integración pasan contra la base nueva, y la base de la app queda intacta;
+  - una fila sobrevive a `down` + `up`, y un segundo `up` no hace nada;
+  - `down -v` borra solo su propio volumen;
+  - con `POSTGRES_APP_DB=foo` se crean `foo` y `foo_test`.
+- **Aislamiento:** `docker volume ls` quedó idéntico a la línea base de 15 volúmenes, incluidos los de `bot-resto-db`.
+- **Guards estáticos:** cada guard falló ante una mutación temporal del compose o del script; después de restaurar, `git diff` quedó vacío.
+- **Seguridad:** el subagente `security` dio 0 altos, 0 medios, 4 bajos (cerrados por el escenario nuevo) y 5 informativos. Los informativos se resolvieron con dos notas en el README y dos deudas, D-34 y D-35; el pin por digest quedó aceptado.
+- **Migración real:** Lautaro paró `bot-resto-db` (sin datos; le sacó el reinicio automático), levantó la base nueva y aplicó las 4 revisiones desde cero. run-verify dio verde contra ella.
+
+**Casos de uso cubiertos.** Ninguno de negocio. Se cubre una base de desarrollo reproducible, con el mismo contrato que el CI, para los changes que siguen (`add-menu-seed`, `add-orders-core`).
