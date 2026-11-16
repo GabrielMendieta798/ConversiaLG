@@ -139,6 +139,101 @@ compose service differs from the image tag of the CI PostgreSQL service.
 - **WHEN** `pytest -m unit` runs
 - **THEN** the parity test passes
 
+### Requirement: Unit tests guard the compose file shape and secrecy
+
+Unit tests, running without network or database, SHALL fail when the compose
+file declares more than one service (`db`) or more than one top-level volume
+(`pgdata`), when any service declares `network_mode`, or when the healthcheck
+reads the application password without the doubled `$$` escape that keeps
+Compose from writing its value into the healthcheck definition.
+
+#### Scenario: Single-dollar password in the healthcheck
+
+- **GIVEN** the healthcheck references `$POSTGRES_APP_PASSWORD` instead of
+  `$$POSTGRES_APP_PASSWORD`
+- **WHEN** `pytest -m unit` runs
+- **THEN** the healthcheck guard fails
+
+#### Scenario: Host networking declared
+
+- **GIVEN** a service of the compose file declares `network_mode: host`
+- **WHEN** `pytest -m unit` runs
+- **THEN** the network guard fails
+
+#### Scenario: Extra service or volume
+
+- **GIVEN** the compose file declares a second service or a second top-level
+  volume
+- **WHEN** `pytest -m unit` runs
+- **THEN** the file-shape guard fails
+
+#### Scenario: Current compose file
+
+- **GIVEN** the compose file of this change
+- **WHEN** `pytest -m unit` runs
+- **THEN** every compose guard passes
+
+### Requirement: A unit test guards what the init script creates
+
+A unit test, reading the init script as text, SHALL fail unless its role
+statement carries each of `LOGIN`, `NOSUPERUSER`, `NOCREATEDB`,
+`NOCREATEROLE` and `NOREPLICATION`, it has exactly two `CREATE DATABASE`
+statements (the application database and its twin) both with the application
+role as `OWNER`, and it contains no `CREATE TABLE`, `CREATE SCHEMA`,
+`CREATE EXTENSION` nor `GRANT`, since the schema comes only from Alembic.
+
+#### Scenario: Privilege attribute removed
+
+- **GIVEN** the role statement of the init script lacks one of `NOSUPERUSER`,
+  `NOCREATEDB`, `NOCREATEROLE` or `NOREPLICATION`
+- **WHEN** `pytest -m unit` runs
+- **THEN** the init script guard fails naming the missing attribute
+
+#### Scenario: Third database or database without the role as owner
+
+- **GIVEN** the init script has a third `CREATE DATABASE` statement, or one
+  `CREATE DATABASE` without the application role as `OWNER`
+- **WHEN** `pytest -m unit` runs
+- **THEN** the init script guard fails
+
+#### Scenario: Schema object or grant in the init script
+
+- **GIVEN** the init script contains `CREATE TABLE`, `CREATE SCHEMA`,
+  `CREATE EXTENSION` or `GRANT`
+- **WHEN** `pytest -m unit` runs
+- **THEN** the init script guard fails naming the statement
+
+#### Scenario: Current init script passes the creation guards
+
+- **GIVEN** the init script of this change, unmodified
+- **WHEN** `pytest -m unit` runs
+- **THEN** every creation guard of the init script passes
+
+### Requirement: A unit test guards how the init script handles the password
+
+A unit test, reading the init script as text, SHALL fail when the script
+passes the password to `psql` with a `-v` assignment, when the SQL heredoc
+delimiter is not quoted, or when the SQL block contains a `$` shell expansion.
+
+#### Scenario: Password passed on the command line
+
+- **GIVEN** the init script passes the password to `psql` with `-v`
+- **WHEN** `pytest -m unit` runs
+- **THEN** the init script guard fails
+
+#### Scenario: Shell expansion inside the SQL
+
+- **GIVEN** the SQL heredoc delimiter is unquoted, or the SQL block contains a
+  `$` expansion
+- **WHEN** `pytest -m unit` runs
+- **THEN** the init script guard fails
+
+#### Scenario: Current init script passes the password guards
+
+- **GIVEN** the init script of this change, unmodified
+- **WHEN** `pytest -m unit` runs
+- **THEN** every password-handling guard of the init script passes
+
 ### Requirement: Data survives restarts and initialization runs once
 
 Stopping and starting the service without removing its volume SHALL keep
