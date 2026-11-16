@@ -1,0 +1,4 @@
+# Los scripts de shell corren dentro de contenedores Linux: un \r de un checkout
+# de Windows los rompe. Se normalizan a LF en el índice y en el working tree
+# (change add-docker-compose-dev-db, design D1).
+*.sh text eol=lf
