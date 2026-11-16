@@ -127,10 +127,13 @@ CREATE DATABASE :"app_db" OWNER :"app_user";
 CREATE DATABASE :"app_test_db" OWNER :"app_user";
 ```
 
-- Los valores entran como **variables de psql** (`-v app_user=...`), y
-  `:"x"` / `:'x'` las citan como identificador y como literal. No se arma SQL
-  concatenando strings en bash (`SEC-4`), y la clave no aparece en la línea de
-  comando de ningún proceso ni en el SQL que se loguea.
+- Los valores entran como **variables de psql**, leídas del entorno con
+  `\getenv` (psql 15+), y `:"x"` / `:'x'` las citan como identificador y como
+  literal. No se usa `-v app_password=...`, porque dejaría la clave en la
+  línea de comando de `psql`, visible en `/proc` del contenedor. No se arma SQL
+  concatenando strings en bash (`SEC-4`). La sesión fija
+  `log_min_error_statement = panic` y `log_statement = 'none'`, así que si un
+  `CREATE ROLE` falla, el log del servidor no guarda su texto con la clave.
 - `app_test_db` se deriva en el script como `${POSTGRES_APP_DB}_test`: es la
   misma regla que aplica el conftest.
 - Antes de crear nada, el script valida que el rol y la base sean
@@ -277,7 +280,10 @@ wrapper:
   default y base `foo`. `--env-file` reemplaza al `.env` del repo: la
   verificación no lee las claves reales de Lautaro ni las imprime;
 - hace `unset` de toda `POSTGRES_*` heredada del shell, para que nada del
-  entorno principal se cuele en la interpolación;
+  entorno principal se cuele en la interpolación, y también de
+  `COMPOSE_PROJECT_NAME`, `COMPOSE_FILE` y `COMPOSE_PROFILES`, para que
+  ninguna variable de Compose del shell cambie el proyecto, el archivo o los
+  servicios sobre los que actúa;
 - arma y exporta la `DATABASE_URL` de verificación (`127.0.0.1:55433`)
   **solo dentro de su propio proceso**, y con `--run <comando>` corre un
   comando del host (alembic, pytest) con esa URL. El entorno del proceso tiene
@@ -319,6 +325,13 @@ teardown) y daría un verde o un rojo que no dice nada de la base real.
 - [En Windows, el script de init podría perder el bit de ejecución o llegar
   con CRLF] → D4 lo hace apto para `source`; `.gitattributes` fuerza LF; un
   task verifica `git ls-files --eol` y el primer arranque real.
+- [Si el init falla a mitad de camino (nombre inválido, error de SQL), el
+  volumen ya quedó inicializado por `initdb` pero sin el rol ni las bases. En
+  el próximo arranque el entrypoint ve datos y saltea el init, así que el
+  healthcheck queda `unhealthy` para siempre] → la única salida es
+  `docker compose down -v` + `up -d --wait` después de corregir la causa. Es
+  seguro porque ese volumen todavía no tiene datos propios. El README lo
+  explica.
 - [Los tests estáticos no prueban runtime] → el runtime se verifica a mano en
   los tasks; los tests cubren las regresiones del archivo.
 
