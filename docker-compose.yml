@@ -1,0 +1,76 @@
+# Base PostgreSQL de desarrollo local (change add-docker-compose-dev-db).
+# Mismo contrato que el CI: misma imagen, rol de la app sin privilegios y las
+# bases <app> y <app>_test con ese rol como dueño. Solo desarrollo: no es el
+# compose de producción ni levanta la app. Las migraciones siguen siendo un
+# paso explícito (alembic upgrade head), no corren al hacer `up`.
+#
+# Las variables salen del .env de la raíz (fuera de Git, SEC-1). Las dos claves
+# son obligatorias y no tienen default en ningún archivo (GEN-3).
+# `docker compose config` imprime las claves interpoladas: su salida no se
+# pega en ningún lado (SEC-2).
+
+# Nombre de proyecto explícito: contenedor, red y volumen quedan con prefijo
+# bot-resto-dev. Otro proyecto (-p bot-resto-verify) tiene los suyos propios.
+name: bot-resto-dev
+
+services:
+  db:
+    # Tag exacto e igual al service del CI (.github/workflows/ci.yml), variante
+    # Debian: mismo locale en_US.utf8 que el CI (SEC-5, design D8). Un test
+    # unitario falla si los dos tags difieren.
+    image: postgres:16.15
+    # Sin nombre de contenedor fijo: Compose lo deriva del proyecto
+    # (bot-resto-dev-db-1),
+    # no choca con el contenedor manual bot-resto-db y deja levantar el
+    # proyecto de verificación al lado (design D6).
+    environment:
+      # Superusuario de bootstrap `postgres` (default de la imagen): solo lo usa
+      # el script de init. La app nunca se conecta con él (design D3).
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (bootstrap superuser password, no default)}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:-bot_resto_user}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?set POSTGRES_APP_PASSWORD in .env (application role password, no default)}
+      # La gemela <base>_test se deriva de este nombre, igual que en el conftest.
+      POSTGRES_APP_DB: ${POSTGRES_APP_DB:-bot_resto}
+    # Solo loopback: la base no queda expuesta en la red local. 5433 por
+    # default evita el 5432 de un PostgreSQL nativo (design D7).
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      # Datos en un volumen nombrado, nunca en un bind mount del repo: OneDrive
+      # sincroniza el árbol y PostgreSQL sobre esa carpeta no es confiable.
+      - type: volume
+        source: pgdata
+        target: /var/lib/postgresql/data
+      # El script de init, como archivo y de solo lectura. El entrypoint lo
+      # corre una sola vez, con el volumen de datos vacío.
+      - type: bind
+        source: ./docker/postgres/init/10-create-app-role-and-databases.sh
+        target: /docker-entrypoint-initdb.d/10-create-app-role-and-databases.sh
+        read_only: true
+    # `healthy` significa usable por la app (design D5): conexión por TCP, como
+    # el rol de la app y con su clave, a la gemela _test, que es lo último que
+    # crea el init. El servidor temporal del init escucha solo en el socket,
+    # así que este chequeo no puede dar verde mientras el init corre.
+    # `$$` hace que las variables las resuelva el shell del contenedor en cada
+    # chequeo: la clave no queda escrita en la definición del healthcheck.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          PGPASSWORD="$$POSTGRES_APP_PASSWORD"
+          psql --no-psqlrc -h 127.0.0.1 -U "$$POSTGRES_APP_USER"
+          -d "$${POSTGRES_APP_DB}_test" -tAqc 'SELECT 1' > /dev/null
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    # Vuelve sola después de reiniciar Docker o la máquina, salvo que alguien la
+    # haya parado a propósito (design D9).
+    restart: unless-stopped
+
+# Sin `name:` ni `external:` a propósito: Compose prefija el volumen con el
+# proyecto (bot-resto-dev_pgdata). Con un nombre fijo, el proyecto de
+# verificación compartiría este volumen y su `down -v` borraría los datos de
+# desarrollo (design D6). Un test unitario lo prohíbe.
+volumes:
+  pgdata:
